@@ -1,0 +1,296 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "默认配置（`hidden_size=768`、`num_attention_heads=8`、`num_key_value_heads=4`、`head_dim=96`）下，`x` 是 `[B, T, 768]`。第 113 行执行完，`xq` 和 `xk` 的**最后一维**分别是多少？",
+    "options": [
+      "`xq: 96`、`xk: 96`——每个投影只输出一个 head 的宽度",
+      "`xq: 768`、`xk: 768`——三个投影的输出宽度是一样的",
+      "`xq: 768`、`xk: 192`——KV 头数是 Q 的一半，所以 384 还要再除以 2",
+      "`xq: 768`、`xk: 384`——`k_proj` 只输出 `num_key_value_heads * head_dim`"
+    ],
+    "answer": [3],
+    "explain": "`q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim)` = `Linear(768, 8*96=768)`；`k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim)` = `Linear(768, 4*96=384)`（model/model_minimind.py:100-101）。实验的 trace 里这两行分别标成 `C=768` 和 `KV*D=384`。选项 C 是把「头数减半」又错误地叠加了一次；选项 A 混淆了「一个 head 的宽度」和「所有 head 拼起来的宽度」——`view` 要到下一行才拆头。",
+    "ref": "model/model_minimind.py#L100-L101"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "把 `num_key_value_heads` 改成 2，其余参数不变。第 115 行 `xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)` 之后 `xk` 的 shape 是？",
+    "options": [
+      "`[B, T, 8, 96]`——`view` 用的是 `num_attention_heads`",
+      "`[B, T, 2, 384]`",
+      "`[B, T, 2, 96]`",
+      "`[B, T, 4, 48]`——头数减半，`head_dim` 会跟着翻倍补回来"
+    ],
+    "answer": [2],
+    "explain": "`n_local_kv_heads` 就是 `num_key_value_heads=2`，而 `head_dim` 是独立字段，默认 `hidden_size // num_attention_heads = 96`，**不随 `num_key_value_heads` 变**。所以 `k_proj` 输出 `2*96=192`，`view` 拆成 `[B, T, 2, 96]`。注意 `xq` 那一行读的是 `n_local_heads`，完全不受影响，仍是 `[B, T, 8, 96]`——这正是 q 和 k/v 分岔的地方。",
+    "ref": "model/model_minimind.py#L114-L116"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`q_norm = RMSNorm(self.head_dim, eps=...)`，并且 `xq = self.q_norm(xq)` 是在 `xq` 被 `view` 成 `[B,T,H,D]` **之后**调用的。这次归一化的均方统计量是在哪一维上算的？",
+    "options": [
+      "`seq_len` 那一维：跨时间步做归一化",
+      "`head_dim=96` 那一维：每个 head 内部的 96 个分量单独算一次",
+      "`hidden_size=768` 那一维：把整条残差流向量当成一个整体",
+      "`num_attention_heads=8` 那一维：跨 head 做归一化"
+    ],
+    "answer": [1],
+    "explain": "`RMSNorm.norm()` 是 `x.pow(2).mean(-1, keepdim=True)`，永远沿**最后一维**（model/model_minimind.py:57）。调用时 `xq` 已经是 `[B,T,H,D]`，最后一维就是 `head_dim=96`，所以每个 `(样本, 位置, head)` 各归各的。选项 C 描述的是 `input_layernorm`（`RMSNorm(hidden_size)`，作用在 `[B,T,C]` 上）；跨时间步或跨 head 归一化会让逐 token 生成和训练不一致，任何 LLM 都不会这么做。",
+    "ref": "model/model_minimind.py#L104-L117"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "第二次 forward 时传了非 `None` 的 `past_key_value`，但把 `use_cache` 设成了 `False`。L121~L123 会发生什么？",
+    "options": [
+      "L121/L122 照常拼接（`xk` 变成 `[B, T_kv, KV, D]`），但 L123 的 `past_kv` 是 `None`",
+      "L121/L122 不执行（不拼接），L123 的 `past_kv` 也是 `None`",
+      "会报错：传了 `past_key_value` 就必须同时 `use_cache=True`",
+      "L121/L122 照常拼接，`past_kv` 也照常是 `(xk, xv)`——`use_cache` 只影响上层要不要收"
+    ],
+    "answer": [0],
+    "explain": "这是两个独立的开关：**拼不拼**由 `if past_key_value is not None` 决定（L120），**存不存**由 `past_kv = (xk, xv) if use_cache else None` 决定（L123）。实测这种组合下 `scores` 仍是 `[3, 8, 5, 12]`（说明确实拼上了 7 个旧 token），而返回的 `past_key_values` 是 `[None]`。这也是训练时的常见配置：不需要 cache，但也不会因为传了 `None` 的 cache 而改变计算。",
+    "ref": "model/model_minimind.py#L120-L123"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`repeat_kv` 的实现是 `x[:,:,:,None,:].expand(bs,slen,kv,n_rep,D).reshape(bs,slen,kv*n_rep,D)`。它等价于对 `x` 在 `dim=2`（头数那一维）调用下面哪个函数？",
+    "options": [
+      "`x.repeat(1, 1, n_rep, 1)`",
+      "`torch.repeat_interleave(x, n_rep, dim=2)`",
+      "`torch.tile(x, (1, 1, n_rep, 1))`",
+      "都不等价：`expand` 出来的东西必须保持 5 维才能用"
+    ],
+    "answer": [1],
+    "explain": "`expand` + `reshape` 的效果是**组内连续复制**：`[kv0, kv0, kv1, kv1, ...]`，正是 `repeat_interleave` 的语义。实验里直接验证了 `torch.equal(repeat_kv(x, n_rep), torch.repeat_interleave(x, n_rep, dim=2))` 为 `True`，而 `torch.equal(repeat_kv(x, n_rep), x.repeat(1,1,n_rep,1))` 为 `False`——`repeat` / `tile` 是把整个头维度整体重复一遍（`[kv0,kv1,kv2,kv3,kv0,kv1,kv2,kv3]`），顺序完全不同，会让 Q head 0 和 KV 组 0、Q head 1 和 KV 组 1 配对，而不是源码期望的 `head // n_rep`。",
+    "ref": "model/model_minimind.py#L86-L89"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`MiniMindConfig(num_key_value_heads=3)`（`num_attention_heads` 仍是 8）。构造模型并跑一次 forward（`flash_attn=False`），会发生什么？",
+    "options": [
+      "构造 `Attention` 的时候就报错：3 不能整除 8",
+      "第 115 行 `xk.view(...)` 报错：384 不能整除 3",
+      "`n_rep = 8 // 3 = 2`，`repeat_kv` 之后只有 6 个头，一直要到第 128 行 `xq @ xk.transpose(-2,-1)` 才抛 `RuntimeError`（8 vs 6）",
+      "能正常跑完：PyTorch 会把 6 个 KV 头自动广播成 8 个"
+    ],
+    "answer": [2],
+    "explain": "`n_rep = self.n_local_heads // self.n_local_kv_heads` 是整除，`8 // 3 = 2`，没有任何断言检查（model/model_minimind.py:97）。`k_proj` 输出 `3*96=288`，L115 的 `view` 拆成 `[B,T,3,96]` 也完全正常。问题一直被推迟到 `repeat_kv` 之后头数变成 `3*2=6`、和 `xq` 的 8 对不上，实测报错是 `RuntimeError: The size of tensor a (8) must match the size of tensor b (6) at non-singleton dimension 1`。**配置写错时报错点离出错原因很远**，这是读这类代码时值得记住的模式。",
+    "ref": "model/model_minimind.py#L97"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "如果把 L124 里 `xq` 那一支的 `.transpose(1, 2)` 去掉（`xk`/`xv` 照旧），第 128 行 `xq @ xk.transpose(-2, -1)` 会怎样？（默认配置，`B=3, T=7`）",
+    "options": [
+      "能跑，只是结果的语义变了：算成了「每个时间步内部 8 个 head 互相 attention」",
+      "能跑，`scores` 变成 `[3, 7, 8, 8]`",
+      "静默出错：shape 仍是 `[3, 8, 7, 7]`，但数值是错的",
+      "抛 `RuntimeError`：`xq` 是 `[3,7,8,96]`、`xk^T` 是 `[3,8,96,7]`，batch 维 `(3,7)` 和 `(3,8)` 广播不了"
+    ],
+    "answer": [3],
+    "explain": "`matmul` 把**最后两维**当矩阵、前面所有维当 batch 并按广播规则对齐。`xq` 不转置就是 `[3, 7, 8, 96]`（batch 维 `(3,7)`），`xk.transpose(-2,-1)` 是 `[3, 8, 96, 7]`（batch 维 `(3,8)`），7 和 8 都不是 1，广播失败。实测报错：`The size of tensor a (7) must match the size of tensor b (8) at non-singleton dimension 1`。这也正是 L124 必须转成 `[B,H,T,D]` 的原因——只有让 `(T, D)` 落在最后两维，`q @ k^T` 才是「每个 head 内部 T 个 query 对 T_kv 个 key」。",
+    "ref": "model/model_minimind.py#L124"
+  },
+  {
+    "id": "q8",
+    "type": "multi",
+    "question": "第 125 行 `if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):` 决定走不走 SDPA。下面哪些是这个判断为真的**必要条件**？（多选）",
+    "options": [
+      "这次调用新喂进来的 token 数 `seq_len > 1`",
+      "`attention_mask` 是 `None`，或者里面全是 1（没有 padding）",
+      "`past_key_value is None`（没有 KV cache）——因为 `self.is_causal` 在这个模型里被硬编码成 `True`",
+      "`config.use_moe` 为 `False`（用的是 Dense FFN 而不是 MoE）"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "前三项就是判断式里的三个独立子条件（第一项 `self.flash` 是构造时就定死的开关）。`self.is_causal = True` 写死在 `__init__`（model/model_minimind.py:99），没有任何配置项能关掉，所以 `not self.is_causal or past_key_value is None` 恒等于 `past_key_value is None`。第四项是干扰项：`use_moe` 只决定 `MiniMindBlock.mlp` 用 `FeedForward` 还是 `MOEFeedForward`，和 `Attention` 内部走哪条分支毫无关系。",
+    "ref": "model/model_minimind.py#L125"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "同一个 seed 构造的两个模型（权重逐位相同），一个 `flash_attn=True` 一个 `flash_attn=False`，喂同一批输入并带上一个**含 0 的** `attention_mask`。两者 logits 的最大绝对误差大约是？",
+    "options": [
+      "精确的 `0.0`：有 padding 时条件 4 不成立，两个模型都被赶去手写分支，执行的是完全相同的指令序列",
+      "还是 `3e-06` 左右，和没有 padding 时一样",
+      "明显变大，因为 SDPA 不支持 padding mask，会算出不同的结果",
+      "没法比较：`flash_attn=True` 的模型遇到 padding 会直接报错"
+    ],
+    "answer": [0],
+    "explain": "`attention_mask` 里只要有一个 0，`torch.all(attention_mask == 1)` 就是 `False`，第 125 行整条 `and` 链断掉，**两个模型都走 `else`**。既然走的是同一段代码、同样的浮点运算顺序，结果必然逐位相同，实测最大误差 `0.00e+00`。没有 padding 时 `flash_attn=True` 的那个走 SDPA、另一个走手写，累加顺序不同，实测误差 `2.98e-06`（logits 量级 2.44）。这个对照正好证明了那点误差纯粹来自分支差异。",
+    "ref": "model/model_minimind.py#L125"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "`B=3`，先 prefill 7 个 token 建好 cache，再**一次性**喂 5 个新 token（默认配置 `H=8, KV=4, D=96`，手写分支）。第 128 行之后 `scores` 的 shape 是？",
+    "options": [
+      "`[3, 8, 12, 12]`",
+      "`[3, 8, 5, 5]`",
+      "`[3, 8, 5, 12]`",
+      "`[3, 8, 12, 5]`"
+    ],
+    "answer": [2],
+    "explain": "query 只有这一轮的 5 个新 token（`xq` 没有参与 L121/L122 的拼接），key 是 `7 + 5 = 12` 个，所以 `scores` 是 `[B, H, T, T_kv] = [3, 8, 5, 12]`——一个「矮而宽」的矩形，行是 query、列是 key。选项 A 误以为 query 也包含历史；选项 D 把行列搞反了（`xq @ xk^T` 的结果里，行数来自 `xq` 的倒数第二维）。",
+    "ref": "model/model_minimind.py#L128"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "手写分支里因果掩码只加在 `scores` 的最后 `seq_len` 列：`scores[:, :, :, -seq_len:] += ...triu(1)`。为什么不对整张 `[B, H, T, T_kv]` 都加？",
+    "options": [
+      "因为前面那 `T_kv - seq_len` 列是 KV cache 里的旧 token，它们在时间上早于这一轮的**所有**新 query，因果关系天然成立、必须全部可见",
+      "因为 `torch.triu` 只接受方阵，只能截出一个方块来加，纯粹是 API 限制",
+      "因为 `repeat_kv` 只把最后 `seq_len` 列复制出来了，前面的列本来就是缺的",
+      "因为 padding mask 那一行已经把前面的列处理掉了，因果掩码不用重复处理"
+    ],
+    "answer": [0],
+    "explain": "没有 cache 时 `T_kv == seq_len`，「最后 seq_len 列」就是整张表，退化成标准下三角；有 cache 时前面的旧列天然全部可见，只有新 token 之间需要 `triu(1)`。实验里 prefill 7 + 续写 5 的那张图，前 7 列一个 `-inf` 都没有，黄色只在最后 5 列的严格上三角里（每个 head 10 个）。选项 B 的前提不成立——`torch.triu` 对非方阵（如 `[3,5]`）照样能用；选项 C、D 张冠李戴：`repeat_kv` 动的是头数维，padding mask 是下一行另外加的。",
+    "ref": "model/model_minimind.py#L129"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "对一个左 padding 的 batch，如果忘了把 `attention_mask` 传给模型（传了 `None`），下面哪个说法是对的？",
+    "options": [
+      "batch 里所有行的 logits 都会明显改变，因为整个 batch 共享同一次矩阵运算",
+      "完全没有影响：`pad_token` 的 embedding 本身是全 0 向量，参与 attention 不会带来偏差",
+      "会直接报错：`attention_mask=None` 时模型不允许输入里含 `pad_token_id`",
+      "只有**确实含 padding** 的那些行会受影响；mask 全 1 的行完全不受影响，因为 `(1 - 1) * -1e9` 恒为 0"
+    ],
+    "answer": [3],
+    "explain": "`scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9`（model/model_minimind.py:130）是逐样本独立的：mask 全 1 的行加的是 0，传不传结果一样。实测（真实 `full_sft` 权重、左 padding）：没有 padding 的长句最后一位 logits 误差 `0.000`、next token 不变；padding 了 9 个位置的 `\"你好\"` 那句误差 `11.709`，next token 从 `'你好'` 变成 `'<|im_end|>'`。`pad_token_id=0` 对应 `<|endoftext|>`，它的 embedding 是模型学出来的普通向量而不是全 0，所以选项 B 错；模型也不会因此报错。",
+    "ref": "model/model_minimind.py#L130"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "把 L132 的 `output.transpose(1, 2).reshape(bsz, seq_len, -1)` 改成 `output.reshape(bsz, seq_len, -1)`（少了转置），会发生什么？",
+    "options": [
+      "抛 `RuntimeError`：元素总数对不上，`reshape` 失败",
+      "不报错，shape 仍然是 `[B, T, H·D]`，程序照跑——但 `reshape` 按内存顺序读数，head 维和时间维被搅在一起，结果是错的",
+      "shape 变成 `[B, H, T·D]`，`o_proj` 随后报维度不匹配",
+      "抛 `RuntimeError`：`transpose` 之后张量不 contiguous，`reshape` 不能用"
+    ],
+    "answer": [1],
+    "explain": "`output` 是 `[B, H, T, D]`，元素总数 `B·H·T·D`；`reshape(bsz, seq_len, -1)` 推出来的最后一维是 `B·H·T·D / (B·T) = H·D`，**shape 完全合法**，一声不吭就跑过去了。但内存里相邻的是同一个 head 的连续时间步，直接压平相当于把 head 和时间混在一起，实测和正确结果 `torch.equal` 为 `False`。这是典型的「shape 检查抓不住」的 bug。选项 D 说反了：不 contiguous 的张量 `reshape` 会自动复制一份，只有 `view` 才会拒绝。",
+    "ref": "model/model_minimind.py#L132"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "关于实验里看到的 attention sink（深层 head 把过半注意力投给第 0 个 token），下面哪个说法是对的？",
+    "options": [
+      "它是 `is_causal=True` 直接造成的：因果掩码强制第 0 个 token 被所有位置看到，所以注意力必然集中在那里",
+      "它只出现在浅层，深层会被 QK-Norm 抹平",
+      "它是训练涌现的现象：softmax 每一行必须和为 1，当某个 query「没什么特别想看的」时，全局可见又几乎不带语义的第 0 个 token 就成了倒掉多余概率质量的地方",
+      "它是 RoPE 的副作用，换成绝对位置编码就不会出现"
+    ],
+    "answer": [2],
+    "explain": "因果掩码只是**让**第 0 个 token 对所有位置可见，并不强迫大家看它——实测第 0 层其余 token 分给它的注意力平均只有 5%，到第 7 层才涨到 61%，方向和选项 B 正好相反。这个比例逐层上升（0.05 → 0.19 → 0.20 → 0.25 → 0.47 → 0.54 → 0.51 → 0.61），是训练过程自己找出来的策略。把 chat 模板去掉、让开头变成一个有实义的字之后，最后一层这个比例掉到 17%，说明它依赖的是「有一个固定且语义空洞的开头」，而不是某个结构组件。",
+    "ref": "model/model_minimind.py#L131"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "`output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv`：为什么要先 `.float()`、算完又 `.type_as(xq)` 转回去？",
+    "options": [
+      "为了把 `-inf` 变成有限的大负数，防止后面的矩阵乘法出错",
+      "因为 `nn.Dropout` 要求输入必须是 fp32，否则报错",
+      "在 fp32 模型上这一行也有实际数值效果，会让结果更精确",
+      "混合精度下 `scores` 可能是 fp16/bf16：低精度 softmax 容易丢精度，而且 `-1e9` 超出了 fp16 的表示范围（上限 65504）会直接变成 `-inf`，所以升到 fp32 算完再降回原 dtype"
+    ],
+    "answer": [3],
+    "explain": "这是「softmax 用高精度算、结果转回原精度」的标准写法，和 Day 2 里 RMSNorm 的 `.float()` 同源。`.float()` 不会把 `-inf` 变成有限值（`-inf` 转 fp32 仍是 `-inf`），选项 A 错；`nn.Dropout` 对 dtype 没有要求，选项 B 错；模型本来就是 fp32 时（本课所有实验）这一行是空操作，选项 C 把「为什么要写这行」和「这次跑起来有没有生效」混为一谈。",
+    "ref": "model/model_minimind.py#L131"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "默认 `hidden_size=768`、`num_attention_heads=8`、`head_dim=96`，把 `num_key_value_heads` 从 8 改成 4，`Attention` 这一个模块（四个投影 + 两个 QK-Norm，全部 `bias=False`）的参数量怎么变？",
+    "options": [
+      "从 2,359,488 降到 1,769,664，少了 589,824——`k_proj` 和 `v_proj` 各砍掉一半",
+      "不变：GQA 只减少计算量和 KV cache，不减少参数量",
+      "直接减半：从 2,359,488 降到约 1,179,744",
+      "少 294,912：只有 `k_proj` 变窄，`v_proj` 不受影响"
+    ],
+    "answer": [0],
+    "explain": "`k_proj` 和 `v_proj` 都是 `Linear(768, KV*96)`：`KV=8` 时各 `768*768=589,824`，`KV=4` 时各 `768*384=294,912`，两个加起来正好少 `589,824`（实测总数 2,359,488 → 1,769,664）。`q_proj` / `o_proj` 各 `768*768` 不变，两个 QK-Norm 各 96 个参数也不变。选项 C 的「减半」高估了：只有 k/v 两个矩阵受影响，q 和 o 两个更大的矩阵原封不动。",
+    "ref": "model/model_minimind.py#L100-L105"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "显式传 `MiniMindConfig(head_dim=128)`（`hidden_size` 仍是 768、`num_attention_heads` 仍是 8），此时 `H·D = 1024 ≠ C = 768`。forward 还能跑通吗？L132 和 L133 之后的最后一维分别是多少？",
+    "options": [
+      "跑不通：`H·D ≠ C`，`output` 加回残差流时 shape 不匹配会报错",
+      "能跑通：L132 之后是 1024、L133 之后是 768——`q_proj: Linear(C, H·D)` 和 `o_proj: Linear(H·D, C)` 一进一出，把 attention 内部的宽度和残差流宽度隔开了",
+      "能跑通，但 `hidden_states` 会从 `[B,T,768]` 变成 `[B,T,1024]`",
+      "跑不通：`head_dim` 是派生属性，显式传会被 `kwargs.get` 忽略"
+    ],
+    "answer": [1],
+    "explain": "实测 `head_dim=128` 时 `q_proj.weight` 是 `[1024, 768]`、`o_proj.weight` 是 `[768, 1024]`，forward 正常，logits 仍是 `[3, 7, 6400]`。`H·D` 只在 attention 内部存在（L132 之后是 `[B,T,1024]`），`o_proj` 立刻把它收回 `hidden_size`，所以残差流始终是 `[B,T,768]`，选项 C 错。Qwen3 正是靠这一点把 `head_dim` 固定在 128，不管 `hidden_size` 怎么变。",
+    "ref": "model/model_minimind.py#L100-L103"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "`B=3`，prefill 7 个 token 之后带着 cache 再喂 **1 个**新 token（默认配置，手写分支）。下面哪一组「L124 之后的 `xq` / L128 之后的 `scores` / L132 之后的 `output`」全对？",
+    "options": [
+      "`[3,8,1,96]` / `[3,8,1,8]` / `[3,1,768]`",
+      "`[3,8,1,96]` / `[3,8,1,8]` / `[3,8,768]`",
+      "`[3,1,8,96]` / `[3,8,8,1]` / `[3,1,768]`",
+      "`[3,8,8,96]` / `[3,8,8,8]` / `[3,8,768]`"
+    ],
+    "answer": [0],
+    "explain": "L124 把 `xq` 转成 `[B, H, T, D] = [3, 8, 1, 96]`（`T` 是**新** token 数 1）；`scores` 是 `[B, H, T, T_kv] = [3, 8, 1, 8]`（`T_kv = 7 + 1 = 8`）；L132 用 `reshape(bsz, seq_len, -1)` 回到 `[B, T, H·D] = [3, 1, 768]`——第二维是 `seq_len=1`，不是头数。选项 B、D 把 `output` 的第二维错当成 `H`；选项 C 漏掉了 L124 的转置。顺带注意：这一步 `seq_len=1` 且有 cache，第 125 行必然为假，所以走的一定是手写分支。",
+    "ref": "model/model_minimind.py#L124-L132"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "先 prefill 7 个 token 建好 cache，再一次性喂 5 个新 token（默认 `B=3, H=8, KV=4, D=96`）。第 123 行 `past_kv = (xk, xv)` 里，`xk` 的 shape 是？",
+    "options": [
+      "`[3, 5, 4, 96]`——只存这一轮新算出来的那 5 个",
+      "`[3, 12, 8, 96]`——存的是已经复制到 8 个头、可以直接给 Q 用的版本",
+      "`[3, 12, 4, 96]`",
+      "`[3, 8, 12, 96]`——已经转置成 `[B, H, T, D]` 布局了"
+    ],
+    "answer": [2],
+    "explain": "看 trace 里第 123 行后面的 `past_kv`：`tuple([B=3, Tkv=12, KV=4, D=96], ...)`。两个关键点：（1）L121/L122 已经把旧的 7 个和新的 5 个在 `dim=1` 上拼成 12，所以不是选项 A；（2）L123 排在 **L124 之前**，`repeat_kv` 和 `transpose` 都还没发生，所以存进去的是 `KV=4` 个头、`[B,T,KV,D]` 布局，不是选项 B/D。这是刻意设计：cache 存 repeat 之前的版本，体积只有 repeat 之后的 `1/n_rep`，否则 GQA 省下的显存就白省了。",
+    "ref": "model/model_minimind.py#L123"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "一个 `flash_attn=True` 的模型连着调用两次：#1 一次性喂 11 个 token（无 cache、无 mask），#2 带着上一步的 cache 只喂 1 个新 token。在 **#2** 那次调用里，126~131 之间哪几行被执行了？",
+    "options": [
+      "只有 126 行——`flash_attn=True` 已经决定了两次都走 SDPA",
+      "126 和 128~131 都执行了",
+      "一行都没执行：`seq_len=1` 时 attention 整个被跳过",
+      "128~131 执行了，126 行没执行"
+    ],
+    "answer": [3],
+    "explain": "在 trace 里点 `#2` 按钮：126 行是暗的，128~131 亮着。第 125 行的 `and` 链里有两项同时不成立——`seq_len > 1` 为假（这次只喂了 1 个新 token），`past_key_value is None` 也为假（带着 cache）。结论是**自回归 generate 的每一个 decode 步都走手写分支**，不管 `flash_attn` 开没开；SDPA 只在 prefill 这种一次性吃多个 token 的场合才可能生效。实测四种场景：`T=11` 无 cache 无 mask → SDPA；`T=11` + 全 1 mask → 仍是 SDPA；`T=11` + 含 0 的 mask → 手写；`T=1` + cache → 手写。",
+    "ref": "model/model_minimind.py#L125-L131"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "prefill 7 个 token 之后一次性续写 5 个，`scores` 是 `[3, 8, 5, 12]`。第 129 行加完 `-inf` 之后，某一个 `(样本, head)` 的 5×12 表里，被屏蔽（`-inf`）的格子怎么分布？",
+    "options": [
+      "前 7 列（旧 cache）全部被屏蔽，后 5 列是下三角",
+      "整张 5×12 按行递增地屏蔽，共 30 个",
+      "前 7 列一个都不屏蔽，只有后 5 列的严格上三角被屏蔽，共 10 个",
+      "一个都不屏蔽：`seq_len < T_kv` 时 `triu(1)` 加出来的全是 0"
+    ],
+    "answer": [2],
+    "explain": "热力图上前 7 列一片深色（值 0），黄色只出现在最后 5 列的严格上三角，共 `5×4/2 = 10` 个。原因是 `scores[:, :, :, -seq_len:]` 只切了最后 `seq_len=5` 列：前面 7 列是 cache 里的旧 token，在时间上早于全部 5 个新 query，因果关系天然成立、必须全部可见（选项 A 正好说反了）。`triu(1)` 造的是 `5×5` 的严格上三角（对角线保留），所以是 10 个而不是 15 个，更不是 30 个。",
+    "ref": "model/model_minimind.py#L129"
+  }
+]

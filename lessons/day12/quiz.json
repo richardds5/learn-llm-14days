@@ -1,0 +1,349 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`critic_model.load_state_dict(state_dict, strict=False)`（trainer/train_ppo.py:390）。如果把 `strict=False` 去掉会发生什么？",
+    "options": [
+      "正常加载，`full_sft_768.pth` 里本来就存了 `value_head.*`",
+      "抛 `RuntimeError: Unexpected key(s) in state_dict: \"lm_head.weight\"`，因为 critic 用不到 lm_head",
+      "抛 `RuntimeError: Missing key(s) in state_dict: \"value_head.weight\", \"value_head.bias\"`",
+      "正常加载，缺失的 `value_head` 会被自动初始化成全 0"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "实验最后三行实测：`missing_keys = ['value_head.weight', 'value_head.bias']`，`unexpected_keys = []`。`value_head` 是 `CriticModel.__init__` 新加的层（train_ppo.py:40），SFT 的 checkpoint 里当然没有它，所以 `strict=True` 会点名这两个 key 报错。\n\n选项 D 的误解最常见：`strict=False` **不会**把缺失的权重清零，而是**保持 `nn.Linear` 自己的随机初始化**（实验里 `std≈0.021`，bias 也是个随机小数）。这正是「PPO 前期 critic 给的价值估计是噪声、reward 涨得慢」的直接原因。",
+    "ref": "trainer/train_ppo.py#L389-L390"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "关于 `CriticModel`（trainer/train_ppo.py:36-48），下面哪一句是**错**的？",
+    "options": [
+      "`value_head` 在 `hidden_size=768` 时只有 769 个参数，所以 critic 的总参数量只比 actor 多 769",
+      "第 45 行的 `self.model.norm(...)` 是第二次归一化，但 RMSNorm 是幂等的，所以等价于 no-op",
+      "`lm_head` 并没有被删掉，但它和 `embed_tokens.weight` 共享存储，不额外占显存",
+      "`forward` 返回 `[B, T]`，prompt 段的每个位置也有一个价值估计"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "B 是错的。`MiniMindModel.forward` 的最后一行已经做过一次 `self.norm(...)`，第 45 行又做了一次，但 RMSNorm **不幂等**：它把 rms 重新拉回 1，再乘上可学习的 `self.weight`。实验最后一行实测 `full_sft` 的 `model.norm.weight.mean() ≈ 1.85`，第二次 norm 让 `values` 变了约 **6%**。\n\nA ✅ 实验表格：actor 63,912,192，critic 63,912,961，差 769 = 768×1 + 1。\nC ✅ `CriticModel` 继承的是 `MiniMindForCausalLM`，`lm_head` 还在；`tie_word_embeddings=True` 让它和 embedding 是同一块存储（Day 2 讲过）。\nD ✅ `value_head(hidden_states)` 是 `[B, T, 1]`，`.squeeze(-1)` 后是 `[B, T]`——覆盖 prompt + response 的每一个位置。",
+    "ref": "trainer/train_ppo.py#L42-L48"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "用 `TorchRolloutEngine` 跑 rollout 时，返回的 `completion_mask` 是什么？",
+    "options": [
+      "`[B, R]` 的真实长度 mask，第一个 EOS 之后为 0",
+      "`[B, P+R]`，prompt 的左 padding 处为 0、response 段为 1",
+      "`[B]`，每个元素是这条 response 的真实 token 数",
+      "`[B, R]` 且**恒为全 1**；真实的右 padding mask 只有 SGLang 引擎才给得出"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "trainer/rollout_engine.py:92 最后一个参数写死是 `attention_mask.new_ones(output_ids.size(0), completion_ids.size(1))`——一个全 1 的 `[B, R]`。实验表格里三条样本「每行 1 的个数」都是 24 = R，哪怕实验最后一行显示其中一条早早就写出了 EOS。\n\n原因是 torch 引擎用的是 `model.generate`，所有序列被拉到同一长度、短的那些在后面继续填 token，引擎层面根本不知道谁先结束。`SGLangRolloutEngine.rollout`（L172）才会按各自的真实长度构造 `[1]*len + [0]*(max-len)`。\n\n同理 `prompt_lens` 在 torch 引擎下恒等于 `P`（L91）。所以 PPO 里真正区分有效位的工作，全落在 `resp_policy_mask` 上。",
+    "ref": "trainer/rollout_engine.py#L90-L92"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "`compute_per_token_logps` 里这一行：`logits = unwrapped(input_ids, ..., logits_to_keep=n_keep + 1).logits[:, :-1, :]`。如果把切片改成 `.logits[:, 1:, :]`（同样得到 `[B, n_keep, V]`），会发生什么？",
+    "options": [
+      "结果完全一样，两种切法都能拿到 `[B, n_keep, V]`",
+      "会在 `torch.gather` 那一行抛 shape 不匹配的 `RuntimeError`",
+      "只有第一个 response token 会算错，其余正确",
+      "每个 response token 拿错了 logits——用的是它**后一个位置**的那一份，整体错一位，不报错但数值明显不同"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "logits 在位置 $i$ 预测的是 token $i+1$。要给最后 `n_keep` 个 token（绝对位置 $T-n_{keep} \\dots T-1$）打分，需要的是位置 $T-n_{keep}-1 \\dots T-2$ 的 logits——所以先保留 `n_keep+1` 个位置，再用 `[:, :-1, :]` **扔掉最后一个**。\n\n改成 `[:, 1:, :]` 保留的是位置 $T-n_{keep} \\dots T-1$，与 `input_ids[:, -n_keep:]` 逐一配对就整体错了一位；shape 仍是 `[B, n_keep, V]`，**不报错**，只会静默算错——实验里用 `full_sft` 实测最大差值 **21.067**（而正确写法和 `ppo_train_epoch` 的全量写法差值是 `0.000e+00`）。\n\n选项 B 描述的是另一处改动：把 `logits_to_keep` 写成 `n_keep`（不 +1），`logits` 变成 `[B, n_keep-1, V]`，这时 `torch.gather` 才会真的报 `Size does not match at dimension 0 expected index [13, 1] to be no larger than self [12, 6400]`。",
+    "ref": "trainer/rollout_engine.py#L29"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "`generate` 在某条序列 finished 之后仍会继续往后填 token。执行完 trainer/train_ppo.py:116-128（torch 引擎，`completion_mask` 全 1），`full_mask` 在 **response 段**里，第一个 EOS **之后**的那些位置是 0 还是 1？",
+    "options": [
+      "0：`full_mask = (gen_out != pad_token_id)` 会把它们挡掉",
+      "0：L123 的 `scatter_` 会用真实长度把它们覆盖成 0",
+      "1：两个原因叠在一起——填的是 `eos_token_id` 不是 `pad_token_id`，而且 L123 的 `scatter_` 把整个 response 段覆盖成了全 1 的 `completion_mask`",
+      "取决于这条序列有没有生成 EOS：有 EOS 的是 0，被 `max_new_tokens` 截断的是 1"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "实验表格「full_mask 在 response 段的 1」这一列三行全是 **11 = R**，而「resp_policy_mask 的 1」是 4 / 11 / 8。\n\n第一层原因：model/model_minimind.py:279 的 `next_token = torch.where(finished, ..., eos_token_id)` —— finished 之后填的是 `eos_token_id`（2），而 `full_mask` 判的是 `!= pad_token_id`（0），当然抓不到。\n第二层原因更彻底：L123 `full_mask.scatter_(1, logp_pos + 1, resp_pad_mask)` 把整个 response 段**直接覆盖**成 rollout 给的 `completion_mask`，torch 引擎下就是全 1——就算前面那层判断能抓到，也会被这一步冲掉。\n\n后果：critic 和 ref 一定会 attend 到那一堆多余的 `<|im_end|>`。真正把它们剔出 loss 的，只有 `resp_policy_mask` / `resp_value_mask`。",
+    "ref": "trainer/train_ppo.py#L116-L128"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`R = 11`，某条 response 在下标 7 处第一次出现 EOS（`resp_pad_mask` 全 1）。执行完 trainer/train_ppo.py:124-128 之后，这一行 `resp_policy_mask` 里有多少个 1？",
+    "options": [
+      "8",
+      "7",
+      "10",
+      "11"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`eos_pos = 7` → `resp_lengths = torch.where(has_eos, eos_pos + 1, ...) = 8` → `resp_policy_mask = (resp_idx < 8)`，即下标 0…7 为 1，共 **8** 个。实验表格第 3 行（`eos_at=7`）就是这个数。\n\n关键是那个 `+1`：**EOS 本身算进有效长度、参与 loss**，被剔除的是 EOS *之后* 的位置。模型必须学会「在合适的时候输出 EOS」，所以这个 token 的 logp 必须能拿到梯度。\n\n顺带核一下另外两行：`eos_at=3` 的那条 `resp_lengths=4`，没有 EOS 的那条 `resp_lengths = resp_pad_mask.sum() = 11`。",
+    "ref": "trainer/train_ppo.py#L124-L128"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "一条 response 长度合格、thinking 段长度合格、恰好含一个 `</think>`、没有任何 3-gram 重复，而 reward model 给了 `+10.0` 分。`calculate_rewards` 返回的值是多少？",
+    "options": [
+      "11.75",
+      "3.0",
+      "1.75",
+      "4.75"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "`0.5`（长度）`+ 1.0`（thinking 长度）`+ 0.25`（`</think>` 恰好一个）`- 0.0`（无重复）`+ 3.0`（RM）= **4.75**。实验最后一行实测就是 4.75。\n\n`10.0` 变成 `3.0` 是因为 `LMForRewardModel.get_score` 的最后一行 `return max(min(score, 3.0), -3.0)`（trainer/trainer_utils.py:177）把 RM 分数硬截断到 $[-3, 3]$。这也决定了带 think 时整个 reward 的取值范围是 $[-4.75, +4.75]$——规则分最多贡献 ±1.75，RM 最多贡献 ±3。\n\n选项 C（1.75）是同一条 response 在 RM=0 时的分数，见实验表格第 4 行。",
+    "ref": "trainer/trainer_utils.py#L167-L177"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "`calculate_rewards` 返回的是 `[B]` 的序列级标量。MiniMind 的 PPO 把它变成逐 token 的 `token_rewards` 的方式是：",
+    "options": [
+      "平均分摊到每个有效 response token 上",
+      "只加到 `token_rewards[i, resp_lengths[i]-1]`，其余位置保持 0",
+      "每个 token 都写成 `-kl_coef * (logp - ref_logp)`，再在最后一个有效 token 上加上序列 reward",
+      "加到 prompt 的最后一个 token 上，让 GAE 从 prompt 末尾开始递推"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "trainer/train_ppo.py:136-138：`token_rewards = torch.zeros_like(old_resp_logp)`，然后只在 `last_idx = resp_lengths - 1` 那一列 `+= rewards`。实验里 `resp_lengths = [11, 7, 4]` 时非零位置是 `[[0,10],[1,6],[2,3]]`，33 个位置里只有 3 个非零，每行的和正好等于 `rewards` 本身（没有被摊薄）。\n\n选项 C 正是 TRL / DeepSpeed-Chat 的经典写法——把**逐 token KL 惩罚折进 reward**、让它参与 GAE 递推。**MiniMind 没有这么做**：它的 KL 以 `args.kl_coef * kl_ref_penalty` 的形式直接加在 `policy_loss` 上（L208-L213），不进 GAE。后果是 KL 只影响梯度，不影响 advantage 的形状。读 RL 代码必须以手上这份源码为准。",
+    "ref": "trainer/train_ppo.py#L136-L138"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "一条长度 7 的 response，critic 给的 `old_resp_values = [0.1, 0.2, …, 0.7]`，reward `2.0` 只落在末位。把 `lam` 从默认的 `0.95` 改成 `1.0`（`gamma` 仍是 `1.0`），`advantages[0]`（第一个 token 的 advantage）是多少？",
+    "options": [
+      "1.9",
+      "2.0",
+      "1.4854",
+      "0.1"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "$\\lambda = 1$ 时 GAE 退化成蒙特卡洛估计：$\\hat A_t = G - V_t$，其中 $G$ 是整条轨迹的回报 `2.0`。所以 $\\hat A_0 = 2.0 - 0.1 = \\mathbf{1.9}$——正是实验表格最后一列「对照：2.0 - V_t」那一行的值。\n\n选项 C 是默认 `lam=0.95` 时的值（实验主表算出来的 1.4854）；选项 D 是 `lam=0` 时的值，此时 advantage 退化成单步 TD 误差 $\\delta_0 = 0 + 1.0\\times0.2 - 0.1 = 0.1$。\n\n三个值排成 `0.1 < 1.4854 < 1.9`，正好体现 $\\lambda$ 在「低方差高偏差」和「高方差低偏差」之间的滑动。",
+    "ref": "trainer/train_ppo.py#L140-L147"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "L147 是 `returns = advantages + old_resp_values`，L149-L151 才做 advantage 的均值方差归一化。那么 critic 拟合的 target `returns`，等于「归一化后的 advantages + old_resp_values」吗？",
+    "options": [
+      "不等于：`returns` 用的是**归一化之前**的 advantage，`returns - old_resp_values` 和归一化后的 `advantages` 对不上",
+      "等于：`returns` 是在归一化之后才被真正使用的，两者数值一致",
+      "等于：L151 末尾乘的 `resp_policy_mask` 会把差异抹平",
+      "不一定：`adv_mean` 接近 0 时两者相等，否则不等"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "实验最后一行实测 `torch.allclose(returns - old_resp_values, adv_norm)` 是 **False**；表格里「returns[i,0]（源码）」和「若用归一化后的 adv 重算 returns」两列也完全对不上（例如样本 0 是 0.3993 vs -1.1216）。\n\n这是有意为之：advantage 归一化是为了稳定 **policy 梯度的尺度**（L210 里 advantage 直接乘在 ratio 上），而 critic 要拟合的是**真实的价值尺度**。如果把归一化后的值当 target，critic 学到的就是一个被压缩过、和 reward 量纲无关的东西，`old_resp_values` 下一轮再拿来算 GAE 就全乱了。\n\n实验的第 2 个 task 验证了反面：把 `returns` 那一行挪到归一化之后，`allclose` 立刻变成 `True`。",
+    "ref": "trainer/train_ppo.py#L147-L151"
+  },
+  {
+    "id": "q9",
+    "type": "multi",
+    "question": "关于 trainer/train_ppo.py:149-151 的 advantage 归一化，下面哪些说法正确？",
+    "options": [
+      "均值和方差是跨整个 batch 的**所有有效 token** 算出的一对标量，不是 per-sequence",
+      "归一化之后，每一条序列自己的均值也都变成了 0",
+      "L151 末尾再乘一次 `resp_policy_mask`，是因为减去 `adv_mean` 会把原本为 0 的无效位变成非零",
+      "分母 `resp_policy_mask.sum().clamp(min=1)` 里的 `clamp` 是为了防止整个 batch 一个有效 token 都没有时除以 0"
+    ],
+    "answer": [
+      0,
+      2,
+      3
+    ],
+    "explain": "A ✅ 分母是 `resp_policy_mask.sum()`——整个 `[B, R]` 上的有效位总数，所以 `adv_mean` / `adv_var` 都是标量。实验打印的全局 `adv_mean=1.1428, adv_std=0.6905` 只有一组。\nB ❌ 实验表格「本行均值（归一化后）」三行分别是 -0.3853 / 0.2837 / 0.5632，都不是 0。全局归一化**故意保留**了序列之间的相对高低；把每条序列各自归一化（GRPO 的组内归一化，Day 13 讲）是另一种设计。\nC ✅ 无效位上 `advantages` 本来是 0，`(0 - 1.1428) * rsqrt(...)` 会变成一个非零值，必须再清一遍。\nD ✅ 和 loss 里每一处 `mask.sum().clamp(min=1)` 同样的保护。",
+    "ref": "trainer/train_ppo.py#L149-L151"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "第一个 ppo_epoch 的第一个 minibatch，actor 一次 `step()` 都还没做过。rollout 时的 `old_resp_logp` 走的是 `compute_per_token_logps`（`logits_to_keep=n_keep+1`），更新时的 `mb_resp_logp` 走的是「全量 forward + 两次 gather」。两者相减得到的 `log_ratio` 会是什么？",
+    "options": [
+      "浮点噪声量级，`max|log_ratio| ≈ 1e-7`，`ratio` 在 1 附近但不严格等于 1",
+      "两条路径切片方式不同，会整体错一位，`log_ratio` 明显非 0",
+      "会因为 shape 不匹配报 RuntimeError",
+      "**逐元素严格等于 0.0**，`ratio` 的 min 和 max 都精确是 1.00000000"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "实验实测：`max|log_ratio| = 0.000e+00`，39 个元素**全部**严格等于 0.0，`ratio` 的 min 和 max 都打印成 `1.00000000`，于是 `approx_kl = 0`、`clipfrac = 0`。\n\n两条路径写法不同，但对**同一组位置**做的是同一串浮点运算（同一份参数、同一个输入、同样的 `log_softmax` 再取同一个下标），结果按位相同。选项 A 是最常见的直觉，但在 CPU/fp32、`eval()` 无 dropout 的条件下并不成立。\n\n这也解释了 `--debug_log_ratio`（L184-L194）这个开关的意义：它就是拿来验证「首个 minibatch 的 ratio 是否真的等于 1」的。实验的第 1 个 task 里，换成 `dropout=0.1` 且 `.train()` 之后，`max|log_ratio|` 直接飙到 `5.19`、`ratio` 最大到 `55.5`（`clipfrac` 从 0 冲到 `0.974`）——这时就说明训练配置有问题。",
+    "ref": "trainer/train_ppo.py#L179-L181"
+  },
+  {
+    "id": "q10",
+    "type": "multi",
+    "question": "在哪些情况下，第一个 ppo_epoch 第一个 minibatch 的 `ratio` 会明显偏离 1？",
+    "options": [
+      "`lm_config.dropout > 0` 且 actor 处于 `train()` 模式",
+      "rollout 换成 SGLang 引擎（logprob 由另一个推理实现给出）",
+      "把 `ppo_update_iters` 从 2 改成 1",
+      "advantage 做了跨 batch 的全局归一化"
+    ],
+    "answer": [
+      0,
+      1
+    ],
+    "explain": "A ✅ 实验的第 1 个 task 实测：`load_model('full_sft', dropout=0.1).train()` 之后 `max|log_ratio|` 到 `5.19`、`ratio` 最大到 `55.5`（`clipfrac` 从 0 冲到 `0.974`）——两次 forward 丢弃的神经元不一样，logp 自然对不上。`ppo_train_epoch` 开头调的是 `actor_model.train()`（L79），所以只要 config 里 dropout 非 0，这个坑就是真的。\nB ✅ SGLang 的 kernel、精度和 MiniMind 自己的 forward 不完全一致，logprob 会有系统性偏差。源码留 `--debug_log_ratio` 主要就是为这两种情况准备的。\nC ❌ `ppo_update_iters` 决定同一批数据重复用几轮，只影响**后续**轮次的 ratio；第一轮第一个 minibatch 的 ratio 与它无关。\nD ❌ advantage 是乘在 ratio **外面**的系数（L210），完全不参与 `log_ratio` 的计算。",
+    "ref": "trainer/train_ppo.py#L184-L194"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`clip_epsilon = 0.2`。某个 token 的 `ratio = 0.5`、`advantage = +1`。关于这个 token，正确的是：",
+    "options": [
+      "梯度被 clip 削成 0，并且计入 `clipfrac`",
+      "梯度被削成 0，但不计入 `clipfrac`",
+      "梯度正常（`d loss/d ratio = -1`），但仍然计入 `clipfrac`",
+      "梯度正常，也不计入 `clipfrac`"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "看实验表格 `ratio=0.5` 那一行：`d loss/d ratio (A=+1)` 是 **-1.0**（没被削），而「计入 clipfrac」是 **True**。\n\nclip 是**单边**的：$A>0$ 时 `max(-A·r, -A·clip(r))` 只在 `r > 1+ε` 那一侧把 loss 压成常数 `-A(1+ε)`；`r < 1-ε` 时 `-A·r > -A·clip(r)`，`max` 选中的是**未裁剪**支，梯度照常。直觉上：clip 只拦「往已经走过头的方向继续走」，不拦「往回走」。\n\n而 L206 的 `clipfrac` 用的是对称判据 `|ratio - 1| > clip_epsilon`，`|0.5-1| = 0.5 > 0.2` 成立。所以 `clipfrac` 统计的是「ratio 跑出区间的比例」，**不等于**「梯度被截断的比例」——它只是个粗糙的监控指标。对称的反例在表的另一端：`ratio=1.21` 时 `A=-1` 的梯度是 1.0（没被削），但同样计入 `clipfrac`。",
+    "ref": "trainer/train_ppo.py#L206-L212"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`old_resp_values = 0.5`、`cliprange_value = 0.2`、`returns = 1.5`。当 `mb_resp_values` 正好等于 target `1.5` 时，这一项的 value loss 和它对 `mb_resp_values` 的梯度分别是多少？",
+    "options": [
+      "loss = 0，梯度 = 0",
+      "loss = 0.32，梯度 = -0.8",
+      "loss = 0.5，梯度 = -1.0",
+      "loss = 0.32，梯度 = 0"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "实验表格 `mb_resp_values = 1.5` 那一行：无 clip 版是 `0.5*(1.5-1.5)² = 0`，裁剪版是 `clamp(1.5, 0.3, 0.7) = 0.7` → `0.5*(0.7-1.5)² = 0.32`，`torch.max` 选中**裁剪支**，所以 loss = **0.32**；而裁剪支在 `|v - old_value| > 0.2` 的区间里是个**常数**（`clamp` 的梯度为 0），所以 `d loss/d v = 0`。\n\n这就是 value clip 的作用：以 `old_resp_values` 为中心，critic 每一步最多只能往 target 方向挪 `cliprange_value`，再远就没有梯度了。它和 policy clip 一样是「取更悲观的那个」，也一样**会把梯度削成 0**——这一点比 policy 端更容易被忽略。",
+    "ref": "trainer/train_ppo.py#L214-L217"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`approx_kl` 超过 `early_stop_kl` 时，源码不是当场 `break`，而是写成 `loss = (policy_loss + vf_coef * value_loss + aux_loss) * 0.0`，然后照常 `loss.backward()`。为什么？",
+    "options": [
+      "必须保证每张卡都走完一次 forward-backward，否则 DDP 的梯度 all-reduce 会对不上、进程互相等待死锁",
+      "乘 0 之后 loss 仍然是 0，能让日志里的曲线更好看",
+      "`break` 会跳过 `optimizer.zero_grad()`，导致上一次的梯度残留到下一个 step",
+      "因为 `stop_ppo` 是在 `dist.all_reduce` 之前算出来的，此时还不确定要不要停"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "trainer/train_ppo.py:222 的注释写得很直白：「早停时必须保证 forward-backward 闭环，故只截断 loss 不中断 DDP 通信」。DDP 把 all-reduce 挂在 backward 的 hook 上，某张卡提前 `break` 就会让别的卡在集合通信上永远等下去。乘 0 之后梯度确实是 0，但通信照常发生。\n\n选项 D 说反了：L198-L200 先把 `approx_kl` 用 `all_reduce(AVG)` 同步成各卡一致的值，再拿去和 `early_stop_kl` 比较——正是为了让所有卡对 `stop_ppo` 做出**相同**的判断。真正的 `break` 要等到下一轮 ppo_epoch 开头的 L165-L166，那时所有卡都已经走完了本轮的全部 minibatch。",
+    "ref": "trainer/train_ppo.py#L222-L228"
+  },
+  {
+    "id": "q14",
+    "type": "multi",
+    "question": "`(policy_loss + vf_coef * value_loss + aux_loss).backward()` 执行完之后，下面哪些参数会拿到非零梯度？",
+    "options": [
+      "actor 的 `model.layers[0].self_attn.q_proj.weight`（经 `ratio`）",
+      "critic 的 `value_head.weight`（经 `mb_resp_values`）",
+      "critic 的 backbone，比如 `critic.model.layers[0].self_attn.q_proj.weight`",
+      "`ref_model` 的参数（它参与了 `kl_ref_penalty` 的计算）"
+    ],
+    "answer": [
+      0,
+      1,
+      2
+    ],
+    "explain": "实验每个 minibatch 都打印了 `|grad actor.q_proj|` 和 `|grad critic.value_head|`，两者都是明显的非零值（1e+0 ~ 1e+1 量级）——**一次 `backward()` 同时喂了两张计算图**：梯度经 `ratio` 流回 actor，经 `mb_resp_values` 流回 critic。\n\nC ✅ `critic_optimizer = optim.AdamW(critic_model.parameters(), ...)`（L407）收的是**整个** `CriticModel`，backbone 和 value_head 一起更新，不是只训一个 head。\nD ❌ `ref_model` 在 L385 就 `.requires_grad_(False)` 了；而且 `ref_resp_logp` 是在 L135 那个 `torch.no_grad()` 块里算好的常量，反向传播到它这里就断了。",
+    "ref": "trainer/train_ppo.py#L226-L228"
+  },
+  {
+    "id": "z1",
+    "type": "single",
+    "question": "一个 batch：`B=3` 条 prompt 左 padding 到 `P=26`，rollout 生成 `R=24` 个 token。下面哪一组 shape 全部正确？",
+    "options": [
+      "`gen_out` [3,50]、`labels` [3,50]、`logp_pos` [3,24]、`values_seq` [3,24]",
+      "`gen_out` [3,24]、`labels` [3,23]、`logp_pos` [3,50]、`values_seq` [3,50]",
+      "`gen_out` [3,50]、`labels` [3,49]、`logp_pos` [3,24]、`values_seq` [3,50]",
+      "`gen_out` [3,50]、`labels` [3,49]、`logp_pos` [3,50]、`values_seq` [3,24]"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`gen_out` 是 prompt+response 拼起来的 `[B, P+R] = [3, 50]`；`labels = gen_out[:, 1:]` 整体错一位，`[3, 49]`（L117）；`logp_pos = prompt_lens.unsqueeze(1) - 1 + resp_idx` 只针对 response 段，`[B, R] = [3, 24]`，取值 25…48（L121）；`values_seq = critic(gen_out, full_mask)` 是 critic 对**整条序列**每个位置的价值，`[B, P+R] = [3, 50]`（L132），再 `gather(1, logp_pos)` 才变成 `[3, 24]` 的 `old_resp_values`。\n\n记忆锚点：带 `seq` / `full` / `gen_out` 的是 `P+R` 长，带 `resp` 的是 `R` 长，`labels` 因为错一位是 `P+R-1`。",
+    "ref": "trainer/train_ppo.py#L116-L133"
+  },
+  {
+    "id": "z2",
+    "type": "multi",
+    "question": "下面哪些量是在 `torch.no_grad()`（或等价的推理上下文）里算出来的？",
+    "options": [
+      "`old_resp_logp`（rollout 返回的 `per_token_logps`）",
+      "`old_resp_values` 与 `ref_resp_logp`",
+      "`advantages` / `returns`",
+      "`mb_resp_values`",
+      "`mb_resp_logp`"
+    ],
+    "answer": [
+      0,
+      1,
+      2
+    ],
+    "explain": "`old_resp_logp` 来自 `TorchRolloutEngine.rollout`，整段在 `with torch.no_grad(), ctx:` 里（trainer/rollout_engine.py:74-88）。`old_resp_values`、`ref_resp_logp`、`token_rewards`、GAE 递推和归一化全部在 trainer/train_ppo.py:130 那个 `with torch.no_grad():` 块内——注释写得很清楚「Rollout阶段只需推理获取old_logp和old_values，切断梯度省显存」。\n\n而 `mb_resp_values`（critic 的新估计，L172）和 `mb_resp_logp`（actor 的新 logp，L179）必须带梯度：它们正是那一次 `loss.backward()` 的两条通路。一个判别口诀：名字里带 `old` / `ref` 的都是常量，带 `mb` 的都带梯度。",
+    "ref": "trainer/train_ppo.py#L130-L151"
+  },
+  {
+    "id": "z3",
+    "type": "multi",
+    "question": "以下关于 MiniMind PPO 实现的说法，哪些**与源码相符**？",
+    "options": [
+      "value loss 做了 clip：以 `old_resp_values` 为中心、`±cliprange_value` 为范围，再和未裁剪版本取 `max`",
+      "loss 里有一项 entropy bonus 用来鼓励探索",
+      "actor 和 critic 各有独立的 AdamW 与 CosineAnnealingLR，但共用同一次 `loss.backward()`",
+      "actor 的 forward 在 `autocast_ctx` 里，critic 的 forward 在它外面",
+      "GAE 递推只在 `resp_policy_mask` 为 1 的位置上跑，无效位置被跳过"
+    ],
+    "answer": [
+      0,
+      2,
+      3
+    ],
+    "explain": "A ✅ L214-L217。\nB ❌ 全文没有 entropy 项；正则只有 `args.kl_coef * kl_ref_penalty`，MoE 时再加一个 `aux_loss`。\nC ✅ L406-L407 建两个 AdamW、L412-L413 建两个 scheduler；但 L226-L228 只有一次 `loss.backward()`，之后 L243-L246 两个 optimizer / scheduler 各自 step。\nD ✅ L171-L172 的 critic forward 在 `with autocast_ctx:` **之外**，L174-L179 的 actor forward 在里面。源码没有解释原因（value head 只输出一个标量、用 fp32 更稳是一种合理猜测），但这是读这段时容易忽略的事实差异。\nE ❌ L141 是 `for t in reversed(range(gen_len))`，在**全部 R 个位置**上跑；无效位置的 `old_resp_values` 已被乘成 0，但 `lastgaelam` 依然会把它们串进来。mask 要到 L149 的归一化和 loss 求和时才生效。",
+    "ref": "trainer/train_ppo.py#L164-L228"
+  },
+  {
+    "id": "z4",
+    "type": "single",
+    "question": "源码里出现了两个 KL 相关的量：L195 的 `approx_kl = mean(0.5 * log_ratio²)` 和 L208-L209 的 `kl_ref_penalty = mean(exp(d) - d - 1)`（`d = ref_logp - new_logp`）。它们的分工是：",
+    "options": [
+      "两个都进 loss，前者权重 `kl_coef`、后者权重 `vf_coef`",
+      "`approx_kl` 只和 `early_stop_kl` 比较做早停（量的是离本轮 old policy 多远）；`kl_ref_penalty` 以 `kl_coef=0.02` 进 `policy_loss`（量的是离 ref 多远）",
+      "两个是同一个量的两种写法，只是数值精度不同，日志里各打一份",
+      "`approx_kl` 进 loss，`kl_ref_penalty` 只用于日志展示"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`approx_kl` 是 KL 的 **k2 估计量**，比较对象是 `old_resp_logp`——也就是**本轮 rollout 时的策略**；它只在 L202 和 `args.early_stop_kl=0.25` 比较，决定要不要 `stop_ppo`，从来不进 loss（L219 只是把这个已 detach 的值存进日志变量 `kl`）。\n\n`kl_ref_penalty` 是 KL 的 **k3 估计量**（无偏、非负、低方差），比较对象是 `ref_resp_logp`——也就是**训练开始时冻结的那份 `full_sft`**；它在 L213 以 `args.kl_coef * kl_ref_penalty` 的形式加进 `policy_loss`，是唯一约束「不要跑得离原模型太远」的正则项。\n\n所以两者的参照系完全不同：一个防「单次更新步子太大」，一个防「整个训练过程漂太远」。",
+    "ref": "trainer/train_ppo.py#L195-L213"
+  }
+]

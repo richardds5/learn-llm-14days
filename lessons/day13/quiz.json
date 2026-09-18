@@ -1,0 +1,296 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "取 `batch_size=3`、`num_generations=2`，三个 prompt 记作 p0/p1/p2。GRPO 里 `outputs`、`rewards`、`advantages` 这些第 0 维长度为 `B*num_gen` 的 tensor，行是怎么排的？",
+    "options": [
+      "`[p0, p1, p2, p0, p1, p2]`——整批 prompt 重复 num_gen 遍",
+      "顺序由 `generate(num_return_sequences=num_gen)` 内部决定，训练脚本不关心",
+      "`[p0, p0, p1, p1, p2, p2]`——每个 prompt 连续重复 num_gen 次",
+      "顺序随机，由 DataLoader 的 shuffle 决定"
+    ],
+    "answer": [2],
+    "explain": "`TorchRolloutEngine.rollout` 用的是 `prompt_ids.repeat_interleave(num_generations, dim=0)`（trainer/rollout_engine.py:76），不是 `repeat`；`calculate_rewards` 里的 `response_idx = i * args.num_generations + j`（trainer/train_grpo.py:46）也印证了同一 prompt 的 G 个回答连续排列。实验 `group_layout` 里「源码算的 i=k//G」和「实测匹配到的 prompt 行」两列完全一致，就是这个排布的直接证据。正因为它，后面 `rewards.view(-1, num_gen)` 的每一行才恰好是一个组。选项 A 是 `repeat(G, 1)` 的结果，用了它 reward / advantage / logps 的行对应关系会**静默**错位（实验 task 2 可以直接改源码看到）；sglang 引擎里的 `[ids for ids in input_ids_list for _ in range(num_generations)]` 同样是 repeat_interleave 语义。",
+    "ref": "trainer/rollout_engine.py#L76"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "某条 completion 是「`<think>` + 一段 35 字的思考 + `</think>` + 一段 40 字的回答」，全文没有重复的 3-gram，reward model 打 0 分。按 `train_grpo.py:54-60` 的规则，它拿到多少 reward？",
+    "options": [
+      "0.5",
+      "1.5",
+      "1.75",
+      "2.25"
+    ],
+    "answer": [2],
+    "explain": "三项相加：全文长度约 85 字落在 `[20, 800]` → **+0.5**（L54）；含 `</think>`，思考段 strip 后约 43 字落在 `[20, 300]` → **+1.0**（L57）；`response.count('</think>') == 1` → **+0.25**（L58）；`rep_penalty(answer)` 为 0，reward model 0 分。合计 1.75，和实验 `reward_scalar` 里 k=2 那一行的输出一致。选 1.5 是漏了 L58 那 0.25；选 2.25 是把长度分重复算了一次——注意 L54 只按**整条 response** 判一次，`answer` 被改写成 `</think>` 后面那段只影响 `rep_penalty` 和 reward model。",
+    "ref": "trainer/train_grpo.py#L54-L60"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "同一组 G=4 条回答的 reward 完全相同（都是 1.0）。按源码 `advantages = (rewards - mean_r) / (std_r + 1e-4)`，这 4 条轨迹的 advantage 是多少？",
+    "options": [
+      "`nan`——分子分母都是 0",
+      "`0.0`",
+      "`1.0`——等于它们共同的 reward",
+      "`inf`"
+    ],
+    "answer": [1],
+    "explain": "分子 `1.0 - 1.0 = 0`，分母 `std_r + 1e-4 = 0 + 1e-4`，所以是 `0 / 1e-4 = 0.0`，不是 `nan`。实验 `group_advantage` 里 g1 组（下标 4~7）四行的 advantage 正是 0.0。这就是 README 里说的 **Degenerate Group（退化组）**：这一组既不被鼓励也不被压制，对梯度零贡献。那个 `1e-4` 就是防 nan 的保险丝——把它改成 0 再跑（实验 task 1），这四行立刻变成 `nan`，而 nan 会顺着 loss 污染整个 batch 的梯度。",
+    "ref": "trainer/train_grpo.py#L125"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`grouped_rewards = rewards.view(-1, args.num_generations)` 之后，下面哪一条和 `train_grpo.py` 的 advantage 计算**完全一致**？",
+    "options": [
+      "`mean`/`std` 都在 `dim=0` 上算，即跨不同 prompt 做归一化",
+      "`mean`/`std` 在 `dim=1` 上算，`std` 用默认的 `unbiased=True`，再用 `repeat(G)` 摊回 `[B*G]`",
+      "先对整个 batch 做全局标准化，再在组内减去均值",
+      "`mean`/`std` 在 `dim=1` 上算，`std` 用 `unbiased=False`，再用 `repeat_interleave(G)` 摊回 `[B*G]`，最后 `(rewards - mean_r) / (std_r + 1e-4)`"
+    ],
+    "answer": [3],
+    "explain": "见 trainer/train_grpo.py:122-125，三个细节都要对上：(1) `dim=1` 才是「组内」，`dim=0` 变成跨 prompt 比较，GRPO 的意义就没了；(2) `unbiased=False` 除以 G 而不是 G−1——这一组只是一次采样，不是要估计总体方差（实验 task 2 改成 `True` 会看到 advantage 的绝对值整体缩到原来的 √((G−1)/G)，G=4 时是 0.866 倍：1.0911 → 0.9448）；(3) 摊开必须用 `repeat_interleave`，和 q1 的行序一致，`repeat` 会把 baseline 配到错误的行上。",
+    "ref": "trainer/train_grpo.py#L122-L125"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "`completion_ids` 的某一行**一个 EOS 都没有**（被 `max_new_tokens` 截断，R=9）。如果把 `eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]` 换成直接写 `eos_idx = is_eos.int().argmax(dim=1)`，这一行最后有几个 token 计入 loss？",
+    "options": [
+      "9 个——没有 EOS 就全部保留",
+      "1 个",
+      "0 个——整行被屏蔽",
+      "会抛 IndexError"
+    ],
+    "answer": [1],
+    "explain": "`argmax` 对**全 0 的行返回下标 0**，于是 `eos_idx` 变成 0，`arange(R) <= 0` 只留下第一个 token——一条完整的长回答被削成一个字，剩下 8 个 token 的梯度全丢，而且不报错。实验 `completion_mask` 表格里「裸 argmax 会给出」那一列，第 1 行正是 0，和「最终 eos_idx = 8」形成对照。所以那一行花式索引不是炫技：它只覆盖 `is_eos.any(dim=1)` 为 True 的行，其余保留默认值 `R-1`（全保留）。",
+    "ref": "trainer/train_grpo.py#L129-L130"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "EOS id = 2，`completion_pad_mask` 全为 True，`completion_ids` 为\n\n```\n[[7, 2, 9, 2, 2, 2],\n [7, 8, 9, 10, 11, 12],\n [2, 2, 2, 2, 2, 2]]\n```\n\n按 `train_grpo.py:128-131` 算出来的 `completion_mask.sum(dim=1)` 是多少？",
+    "options": [
+      "`[2, 6, 1]`",
+      "`[2, 0, 1]`",
+      "`[1, 1, 1]`",
+      "`[4, 6, 6]`"
+    ],
+    "answer": [0],
+    "explain": "第 0 行第一个 EOS 在下标 1，`<= 1` 保留 2 个 token（EOS 自己也算，是**闭区间**）。第 1 行没有 EOS，`is_eos.any(dim=1)` 为 False，`eos_idx` 保持默认的 `R-1 = 5`，6 个 token 全保留——去掉 `.any()` 保护的话这里会变成 1（选项 B/C 的错法）。第 2 行第一个 EOS 在下标 0，只保留 1 个。选项 D 是把「第一个 EOS 之后的 EOS 也算有效」的错法。",
+    "ref": "trainer/train_grpo.py#L128-L131"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "设 `batch_size=3`、`num_generations=5`、左 padding 后 `P=24`、`max_gen_len R=26`、`vocab_size=6400`。那么 `F.log_softmax(res.logits[:, :-1, :], dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1)` 这一步（**还没接** `.gather(1, logp_pos)`）的 shape 是？",
+    "options": [
+      "`[15, 26]`",
+      "`[15, 50]`",
+      "`[15, 49]`",
+      "`[3, 49]`"
+    ],
+    "answer": [2],
+    "explain": "`outputs` 是 `[B*num_gen, P+R] = [15, 50]`，`res.logits[:, :-1, :]` 是 `[15, 49, 6400]`，用 `outputs[:, 1:]`（`[15, 49]`）沿 `dim=2` gather 再 squeeze，得到 `[15, 49]`——这是**每个位置上真实 next token 的 logp**，还覆盖着整个 prompt 区间。最后那个 `.gather(1, logp_pos)`（`logp_pos` 是 `[15, 26]`，值域 23…48）才把 completion 那 26 个位置挑出来变成 `[15, 26]`。选项 A 是最终结果，不是这一步的结果。",
+    "ref": "trainer/train_grpo.py#L102"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`full_mask.scatter_(1, logp_pos + 1, rollout_result.completion_mask...)`（train_grpo.py:94）这一行防的是什么？",
+    "options": [
+      "`attention_mask` 必须是 bool，scatter 顺便把它转了类型",
+      "prompt 区间的左 padding 被算错了，需要覆写回来",
+      "`logp_pos` 要 +1 才能和 logits 对齐，这一行就是在做那次对齐",
+      "`(outputs != tokenizer.pad_token_id)` 会把模型**真的生成出来的、id 恰好等于 pad_token_id** 的 token 误判成 padding；这行用引擎给的 `completion_mask` 把 completion 区间覆写回真值（顺带让 sglang 的右 padding 生效）"
+    ],
+    "answer": [3],
+    "explain": "L92 的 `full_mask` 是按「等于 pad id 就算 padding」推出来的，而 MiniMind 的 `pad_token_id = 0 = <|endoftext|>` 是词表里一个货真价实的 token，模型完全可能吐出来——那一格的 attention 就凭空消失了。实验 `logp_pos` 的第一张热力图里，第 1 行 completion 区间那个紫色格子就是被误伤的位置，scatter 之后变回黄色。另外 `logp_pos+1` 指的是 completion token **自己**占的列（P…P+R−1），不是取 logp 的位置（那是 `logp_pos` 本身，差一位），所以选项 C 把两者混为一谈了。",
+    "ref": "trainer/train_grpo.py#L92-L94"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "用 torch 引擎跑一个 GRPO step，`ratio = torch.exp(per_token_logps - old_per_token_logps)` 这一批 `[12, 16]` 个值的 min 和 max 分别是多少？",
+    "options": [
+      "min ≈ 0.8、max ≈ 1.2——被 `epsilon=0.2` 夹在这个区间里",
+      "min = max = 1.000000",
+      "min ≈ 0.5、max ≈ 2.0——采样带来的自然波动",
+      "分散在 0 到 5 之间，接近 `epsilon_high` 的上界"
+    ],
+    "answer": [1],
+    "explain": "`old_per_token_logps` 是 rollout 里用**同一份权重**算出来的（引擎内部走 `compute_per_token_logps`，只是用了 `logits_to_keep` 这个省算力的写法），训练 forward 换个写法算的是同一个东西，实验里两者逐元素之差是 0；再加上 GRPO 每个 batch 只更新一次策略（不像 PPO 有 `ppo_update_iters` 轮 minibatch），所以 torch 引擎下的 GRPO 是**纯 on-policy**，ratio 恒等于 1。选项 A 是常见误解：`epsilon` 是 clip 的边界，不是 ratio 的取值范围——恰恰相反，ratio≡1 时 clip 根本不会激活。要看到 ratio 真的偏离 1，得换 sglang 引擎（`update_policy` 默认 10 步才同步一次）。",
+    "ref": "trainer/train_grpo.py#L135"
+  },
+  {
+    "id": "q7",
+    "type": "multi",
+    "question": "关于 GRPO 一个 step 里的三份 per-token logps，下面哪些说法正确？（多选）",
+    "options": [
+      "`old_per_token_logps` 来自 `rollout_result`，训练循环里立刻 `.detach()`，反向时不产生梯度",
+      "`ref_per_token_logps` 在 `torch.no_grad()` 里算，而且 `ref_model` 本身被 `.eval().requires_grad_(False)` 冻结",
+      "`per_token_logps`（policy 的那份）是整个 loss 里唯一的梯度入口",
+      "因为 `old_per_token_logps` 被 detach 了，所以 `ratio = exp(per_token_logps - old_per_token_logps)` 整体也不带梯度"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "A 见 train_grpo.py:90，B 见 train_grpo.py:104-105 和 278 行的 `ref_model.eval().requires_grad_(False)`，C 见 train_grpo.py:102——默认 `use_moe=0` 时 `aux_loss` 是常量 `torch.tensor(0.0)`，整个 loss 的梯度只能从这份 logps 走；只有开了 MoE，`aux_loss` 才会成为第二条梯度路径。D 错：detach 的只是减号右边，`ratio` 仍然通过 `per_token_logps` 带梯度——这正是 GRPO 分支里 clip 能「掐断梯度」的前提。CISPO 分支才额外对 `clamped_ratio` 显式 `.detach()`，让梯度只从末尾的 `per_token_logps` 走。",
+    "ref": "trainer/train_grpo.py#L102-L105"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "关于 `per_token_kl = torch.exp(kl_div) - kl_div - 1`（k3 估计器），哪一条和实验 `kl_k3` 的结果一致？",
+    "options": [
+      "k3 可能取负值，所以工程上还要 `clamp(min=0)` 一次",
+      "k3 恒 ≥ 0（等号只在 `kl_div = 0` 取到），均值贴着真 KL；而 `k1 = -kl_div` 的均值也在真 KL 附近，却会在近一半样本上取负值、std 大好几倍",
+      "k3 是 k1 的平方，所以非负，但期望不等于真 KL",
+      "k3 只在 `kl_div > 0` 的 token 上非零，`kl_div < 0` 时它是 0"
+    ],
+    "answer": [1],
+    "explain": "实测（2016 个从 π_θ 采样的 token）：真 KL 0.04168，k3 给 0.04123、std 0.1024、负值 0 个；k1 给 0.03670、std 0.2936、负值 910 个（45%）。$e^x - x - 1 \\ge 0$ 对任意实数成立，等号只在 $x=0$ 取到，所以 C、D 都不对（k2 = lr²/2 才是「非负但有偏」的那个，实测 0.04375 偏高）。k1 的负值是实打实的麻烦：loss 里写的是 `- args.beta * per_token_kl`，惩罚项一旦变成负数，就等于在**奖励**策略离 ref 更远。",
+    "ref": "trainer/train_grpo.py#L133-L134"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "`loss_type=\"grpo\"`、`epsilon=0.2`。某个 token 的 advantage `A > 0`、`ratio = 1.5`。这个 token 的**策略项**对 `per_token_logps` 的梯度是多少？",
+    "options": [
+      "`-1.5·A`",
+      "`-1.2·A`",
+      "`0`",
+      "`-A`"
+    ],
+    "answer": [2],
+    "explain": "A>0 时 `torch.min` 会选更小的那支：`clamp(1.5, 0.8, 1.2)·A = 1.2A < 1.5A`，于是被选中的是 `clipped_ratio` 那一支；而 `torch.clamp` 在区间**外**的梯度是 0，所以整个策略项对 logπ 的梯度归零——实验 `loss_variants` 里 `grpo A=+1` 这条线从 ratio>1.2 起就贴着 0（打印出来的归零区间是 `[1.25, 6.00]`，1.25 是采样网格的第一个点）。选 `-1.2·A` 是最常见的误解：clip 夹的是**数值**，梯度是直接断掉而不是变成边界值。同样条件下 CISPO 给的是 `-min(1.5, 5.0)·A = -1.5A`，梯度不断。",
+    "ref": "trainer/train_grpo.py#L140-L143"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "MiniMind 的 torch 引擎下 `ratio` 恒等于 1。此时把 `loss_type` 从 `cispo` 换成 `grpo`，会发生什么？",
+    "options": [
+      "策略项对 `per_token_logps` 的梯度逐元素完全相同，只有打印出来的 loss 数值不同",
+      "梯度方向反过来，训练会朝相反的方向走",
+      "GRPO 的 clip 会把大约一半 token 的梯度掐掉，梯度范数明显变小",
+      "会报错，因为 grpo 分支不读 `epsilon_high`"
+    ],
+    "answer": [0],
+    "explain": "ratio=1 落在 `[1−ε, 1+ε]` 内部，`torch.clamp` 此时是恒等映射（梯度 1），`min(rA, clip(r)A)` 两支相等，$\\partial/\\partial\\log\\pi = -A$；CISPO 那边 `clamp(1, max=5).detach() = 1`，$\\partial/\\partial\\log\\pi = -1\\cdot A = -A$。两者逐元素相同（在同一批数据上实测最大差为 0.0）。但 loss 的**数值**不同：GRPO 的策略项是 $-A$，CISPO 的是 $-A\\log\\pi_\\theta$，而 $\\log\\pi_\\theta$ 是个不小的负数。差别要等 ratio 真的偏离 1 才出现（比如人为把 old logps 挪 0.3，ratio≈1.35 时 GRPO 有 42% 的 token 梯度归零，两者的梯度范数就分开了）——那正是 sglang 引擎的场景。",
+    "ref": "trainer/train_grpo.py#L136-L143"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)).mean()` 这一行的聚合语义是什么？",
+    "options": [
+      "全局 token 平均：一条 40 token 的长回答对梯度的贡献是 4 token 短回答的 10 倍",
+      "先在每条序列内部对有效 token 求均值得到 `[B*num_gen]`，再对所有序列求均值；每条轨迹权重相等，与长度无关",
+      "只在每条序列的最后一个有效 token 上算 loss，其余位置被 mask 掉",
+      "`clamp(min=1)` 的作用是把每条回答的有效长度限制成至少 1 个 token，从而限制最短生成长度"
+    ],
+    "answer": [1],
+    "explain": "`sum(dim=1) / mask.sum(dim=1)` 是**序列内**的 token 平均，结果 shape `[B*num_gen]`；再 `.mean()` 是序列间平均。实验 `loss_reduce` 用 autograd 把权重直接读了出来：源码这一列恒等于 1/6=0.1667，和长度完全无关；而全局平均（选项 A 描述的 `sum() / mask.sum()`）那一列是 `len_k / Σlen`，40 token 的那条拿 0.4706、3 token 的只有 0.0353。DAPO 等变体改的正是这里。`clamp(min=1)` 只是防「整行 mask 全 0」时除零（去掉它那一行的权重会变成 `nan`），和生成长度无关。",
+    "ref": "trainer/train_grpo.py#L144"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "下面哪一件事**不**属于 `RolloutEngine` 的职责（即不在 `trainer/rollout_engine.py` 里做）？",
+    "options": [
+      "把 prompt 复制成 G 份并采样出 completion",
+      "算出采样时策略的 per-token logp（`old_per_token_logps`）",
+      "把 `rewards` 在组内归一化成 advantage",
+      "把 `completion_ids` 解码成 `list[str]` 交给打分函数"
+    ],
+    "answer": [2],
+    "explain": "抽象基类只要求两个方法：`rollout`（prompt → `RolloutResult` 六个字段）和 `update_policy`（同步权重）。复制宽（L76）、采样、算 old logps（L88）、`batch_decode`（L89）全在引擎里；而组内归一化 advantage 在 `train_grpo.py:122-125`，completion mask 在 128-131，loss 在 135-144，统统留在训练脚本。这条边界正是 PPO（`num_generations=1`）、GRPO、Agent RL 能共用同一层的原因——引擎只负责「给我 prompt，还我 completion + logp」。",
+    "ref": "trainer/rollout_engine.py#L50-L60"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`SGLangRolloutEngine.update_policy` 是怎么把训练进程里的新权重同步给 sglang 推理服务的？",
+    "options": [
+      "用 NCCL 把 GPU 显存里的权重直接广播给 sglang 进程，零拷贝",
+      "rank 0 把 `half().cpu()` 的 state_dict 用 `save_pretrained(safe_serialization=False)` 写进共享目录，再 `POST /update_weights_from_disk` 让 server 自己从磁盘热加载",
+      "每次 `rollout` 的 HTTP payload 里都带上最新的 state_dict",
+      "只调 `flush_cache()` 清掉 KV cache，server 下次请求时会自动重新读权重"
+    ],
+    "answer": [1],
+    "explain": "见 trainer/rollout_engine.py:175-193：只有 rank 0 落盘（顺带 `tokenizer.save_pretrained`），然后 HTTP 通知 server 加载，结果再用 `dist.broadcast` + `dist.barrier` 同步给所有 rank，失败就 `raise RuntimeError`——避免一半 rank 用新权重、一半用旧的。D 描述的 `flush_cache` 是**换完权重之后**的补充动作：RadixAttention 里缓存的 KV 前缀是旧模型算的，必须清掉，但它本身不加载任何权重。另外 `update_policy` 只在 `step % args.save_interval == 0` 时被调用（train_grpo.py:194，默认 10），所以中间若干步的 sglang rollout 用的是旧权重，ratio 会真的偏离 1。",
+    "ref": "trainer/rollout_engine.py#L175-L193"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "关于 `train_grpo.py:146-153` 这段（`accumulation_steps` 默认 1、`grad_clip` 默认 1.0），哪一条正确？",
+    "options": [
+      "`accumulation_steps=1` 时每个 step 都会更新参数，且梯度裁剪发生在 `optimizer.step()` **之前**",
+      "梯度裁剪写在 `loss.backward()` 之前，先限制反传的梯度再回传",
+      "`scheduler.step()` 每个 epoch 走一次，所以余弦退火的周期是 epoch 数",
+      "`optimizer.zero_grad()` 在 `backward()` 之前调用，否则梯度会累积"
+    ],
+    "answer": [0],
+    "explain": "顺序是 `loss.backward()` → `if step % accumulation_steps == 0:` → `clip_grad_norm_` → `optimizer.step()` → `scheduler.step()` → `zero_grad()`。裁剪必须在 `step()` 之前（`backward()` 之后梯度才存在，`step()` 之后再裁就没意义了），所以 B 也不成立。`scheduler` 是 `CosineAnnealingLR(T_max=total_optimizer_steps)`，跟着**优化器步**走而不是 epoch（C 错）。`zero_grad()` 放在 `step()` 后面正是梯度累积的写法：不清零，下一个 micro-batch 的梯度才能叠上去（D 错）。另外 GRPO 默认 `learning_rate=3e-7`，比 SFT 小三个数量级。",
+    "ref": "trainer/train_grpo.py#L146-L153"
+  },
+  {
+    "id": "q15",
+    "type": "multi",
+    "question": "相比 `train_ppo.py`，`train_grpo.py` 去掉 / 改掉了哪些东西？（多选）",
+    "options": [
+      "去掉了 `CriticModel`、它的 optimizer/scheduler 以及 value loss",
+      "去掉了 GAE 的逐 token 反向递推，advantage 变成序列级标量再广播到每个 token",
+      "去掉了 reference model 与 KL 惩罚项，只靠 clip 约束更新幅度",
+      "去掉了「把序列 reward 加到最后一个有效 token 上」这一步，reward 直接进组内归一化"
+    ],
+    "answer": [0, 1, 3],
+    "explain": "A、B、D 正是 GRPO 的核心简化：没有 critic 就没有 $V(s_t)$，也就没法做 GAE（对比 train_ppo.py:140-145 里的 `lastgaelam` 倒序递推），于是改用同组 reward 均值当 baseline，reward 也不需要先摊到 token 上。C 错：`ref_model` 和 `args.beta * per_token_kl` 在 GRPO 里原样保留（train_grpo.py:105、134、138/143）。反过来 GRPO 还多了一样 PPO 没有的东西——每个 prompt 要采样 `num_generations` 次（PPO 那边写死 `num_generations=1`，见 train_ppo.py:91），而且一批 rollout 只更新一次（PPO 有 `ppo_update_iters`，默认 2）。",
+    "ref": "trainer/train_grpo.py#L122-L125"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "仍取 `B=3`、`G=5`、`P=24`、`R=26`。下面哪一组 shape 全部正确？",
+    "options": [
+      "`grouped_rewards` `[15, 1]`、`advantages` `[3, 5]`、`per_token_loss` `[15, 50]`",
+      "`grouped_rewards` `[3, 5]`、`advantages` `[15, 26]`、`per_token_loss` `[15, 26]`",
+      "`grouped_rewards` `[5, 3]`、`advantages` `[15]`、`per_token_loss` `[15, 49]`",
+      "`grouped_rewards` `[3, 5]`、`advantages` `[15]`、`per_token_loss` `[15, 26]`"
+    ],
+    "answer": [3],
+    "explain": "`rewards` 是 `[B*G] = [15]`，`view(-1, G)` 得到 `[B, G] = [3, 5]`（一行一组，不是 `[5, 3]`）；`advantages` 和 `rewards` 同形，仍是 **序列级** 的 `[15]`，要靠 `advantages.unsqueeze(1)` → `[15, 1]` 才广播到 token 级；`per_token_loss` 和 `ratio`、`per_token_kl`、`completion_mask` 一样是 `[B*G, R] = [15, 26]`。`[15, 50]` 是 `outputs`（P+R），`[15, 49]` 是还没做 `gather(1, logp_pos)` 的中间量。",
+    "ref": "trainer/train_grpo.py#L122-L138"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "GRPO 训练日志里 `Adv Std: 0.0000` 持续了几百个 step，`Actor Loss` 也一直贴着 0，但程序不报错、reward 数值正常。最可能的原因是？",
+    "options": [
+      "学习率 `3e-7` 太小，advantage 来不及变化",
+      "`completion_mask` 整行全 0，被 `clamp(min=1)` 兜住了",
+      "每个 prompt 的 G 条回答拿到的 reward 几乎完全相同（退化组），advantage 被组内归一化成了 0",
+      "`ratio` 恒等于 1，clip 从不激活，所以策略项没有梯度"
+    ],
+    "answer": [2],
+    "explain": "advantage 是**组内** z-score，只要同组 G 条 reward 相同，分子就是 0，`(0)/(0+1e-4) = 0`，整批 advantage 全 0 → CISPO 的策略项 `-clamped_ratio * A * logπ` 也全 0 → 梯度只剩 KL 项（第一步还恰好是 0）。常见诱因是 reward 函数区分度不够（规则分全都命中同一档）或采样温度太低导致 G 条回答几乎一样——实验 `mini_grpo_step` 的 task 1 把 temperature 从 0.9 调到 0.2 就能看到 `Adv Std` 从 1.04 掉到 0.85 的趋势。A 错：advantage 的计算和学习率无关。B 只影响单行。D 描述的 ratio≡1 在 torch 引擎下本来就永远成立，但它不会让 advantage 变 0，策略项照样有梯度。",
+    "ref": "trainer/train_grpo.py#L122-L125"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "关于两种 rollout 引擎下 `ratio` 和 clip/clamp 的**实际**行为，哪一条正确？",
+    "options": [
+      "torch 引擎下 ratio 恒为 1，GRPO 的 clip 和 CISPO 的 clamp 都不会激活，两者的策略梯度完全相同（只有 loss 的数值不同）",
+      "torch 引擎下 ratio 分布在 `[1-ε, 1+ε]` 里，clip 经常触发，这正是 GRPO 稳定的原因",
+      "sglang 引擎下 ratio 也恒为 1，因为 `update_policy` 每个 step 都会同步权重",
+      "两种引擎下 CISPO 的 clamp 都不会触发，因为 `epsilon_high=5.0` 定得太大，ratio 永远够不着"
+    ],
+    "answer": [0],
+    "explain": "torch 引擎里 `old_per_token_logps` 是同一份权重在 rollout 里算的，而且每批只更新一次策略，实测 `ratio.min() == ratio.max() == 1.0`；此时 `clamp` 是恒等映射、`min` 两支相等，两个分支的 $\\partial\\mathcal{L}/\\partial\\log\\pi$ 逐元素相同（最大差 0.0），只有 loss 的数值不同。C 错：`update_policy` 只在 `step % args.save_interval == 0` 时调用（默认 10 步一次），中间 9 步的 sglang rollout 用的是旧权重，ratio 才真的偏离 1——这也是 MiniMind 默认 `loss_type=\"cispo\"` 的动机：ratio 偏离时 CISPO 不会把梯度掐断。D 错：ratio 真正偏离时 clamp 会触发，而且 GRPO 的 `epsilon=0.2` 比它敏感得多。",
+    "ref": "trainer/train_grpo.py#L194"
+  }
+]

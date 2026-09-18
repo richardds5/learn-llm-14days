@@ -1,0 +1,18 @@
+learn-llm-14days
+Copyright (c) 2026 richard.g — MIT License (see LICENSE)
+
+This repository bundles third-party code:
+
+  minimind/
+    Source:   https://github.com/jingyaogong/minimind
+    Version:  commit a3c7b01cc004d5de86aea961f20bf1e638e7c09e (2026-09-10)
+    Author:   jingyaogong
+    License:  Apache License 2.0 (minimind/LICENSE)
+    Changes:  none. Files are byte-identical to upstream; images/ and the
+              upstream README / CODE_OF_CONDUCT were omitted. Lesson text quotes
+              this code by file and line number, which is why the snapshot is
+              pinned to one commit.
+
+The model weights (jingyaogong/minimind-3-pytorch) and datasets
+(jingyaogong/minimind_dataset) fetched by scripts/download.py are not part of
+this repository; they are released by their author under their own terms.

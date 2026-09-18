@@ -1,0 +1,17 @@
+# 运行时生成
+venv/
+progress.json
+workspace/
+.runs/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+.vscode/
+
+# 下载的权重和数据（python scripts/download.py）：minimind/dataset/ 里只保留上游自带的三个文件
+minimind/out/
+minimind/dataset/*
+!minimind/dataset/__init__.py
+!minimind/dataset/lm_dataset.py
+!minimind/dataset/dataset.md

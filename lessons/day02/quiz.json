@@ -1,0 +1,282 @@
+[
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "`MiniMindConfig(hidden_size=512)`，其余参数一律不传。`head_dim` 和 `intermediate_size` 会是多少？",
+    "options": [
+      "`head_dim=96`，`intermediate_size=2432`（这两个是写死的默认值，不随 hidden_size 变）",
+      "`head_dim=64`，`intermediate_size=2048`（I 是 4·C 的惯例）",
+      "`head_dim=96`，`intermediate_size=1664`",
+      "`head_dim=64`，`intermediate_size=1664`"
+    ],
+    "answer": [3],
+    "explain": "看实验表格的第 4 列（`MiniMindConfig(hidden_size=512)`）里 D 和 I 两行：`head_dim = kwargs.get(\"head_dim\", self.hidden_size // self.num_attention_heads)` = 512//8 = **64**；`intermediate_size = math.ceil(512*π/64)*64 = ceil(25.13)*64 = 26*64 = **1664**。两者都是由 `hidden_size` **派生**出来的，不是常量——这也是选项 A 的误解来源（把默认配置下的 96 / 2432 当成了固定值）。",
+    "ref": "model/model_minimind.py#L24-L26"
+  },
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "如果显式传 `MiniMindConfig(head_dim=128)`（`hidden_size` 仍是 768、`num_attention_heads` 仍是 8），那么 `H·D = 1024 ≠ C = 768`。模型还能正常前向吗？",
+    "options": [
+      "不能：`Attention` 里 `output.reshape(bsz, seq_len, -1)` 之后必须等于 `C` 才能加回残差流",
+      "能：`q_proj` 是 `Linear(C, H·D)`、`o_proj` 是 `Linear(H·D, C)`，`H·D` 只在 attention 内部出现，进出残差流的宽度还是 `C`",
+      "不能：`head_dim` 是只读的派生属性，显式传会被 `kwargs.get` 忽略掉",
+      "能，但 `hidden_states` 的 shape 会从 `[B,T,768]` 变成 `[B,T,1024]`"
+    ],
+    "answer": [1],
+    "explain": "源码 L100/L103：`q_proj = Linear(hidden_size, num_attention_heads * head_dim)`，`o_proj = Linear(num_attention_heads * head_dim, hidden_size)`。两个投影一进一出，把 `H·D` 这个内部宽度和残差流宽度 `C` 彻底解耦了——这正是 `head_dim = kwargs.get(\"head_dim\", C // H)` 这种写法的意义（Qwen3 就是这么用的）。实测 `head_dim=128` 时 `q_proj.weight` 是 `[1024, 768]`、`o_proj.weight` 是 `[768, 1024]`，前向正常，logits 仍是 `[3, 7, 6400]`。",
+    "ref": "model/model_minimind.py#L100-L103"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "同样是 `hidden_size=768`，MiniMind 的 `intermediate_size` 和 LLaMA 系惯例的 `8/3·C`（同样对齐到 64 的倍数）比，宽了多少？",
+    "options": [
+      "一样宽，两条公式取整到 64 的倍数之后都落在 2432",
+      "宽约 19%：2432 vs 2048",
+      "宽约 50%：2432 vs 1600",
+      "反而窄了约 15%：2432 vs 2816"
+    ],
+    "answer": [1],
+    "explain": "看实验表格 `C = 768` 那一行的第 3、4、5 列：MiniMind 是 `ceil(768·π/64)·64 = ceil(37.70)·64 = 38·64 = 2432`，LLaMA 惯例是 `ceil(768·(8/3)/64)·64 = ceil(32)·64 = 2048`，**+18.8%**。系数之比就是 `π / (8/3) ≈ 1.178`，取整到 64 的倍数后在各个 C 上都稳定在 17~19%。",
+    "ref": "model/model_minimind.py#L26"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "都不传任何参数时，`MiniMindConfig().bos_token_id` 和 `PretrainedConfig().bos_token_id` 分别是什么？",
+    "options": [
+      "MiniMindConfig 是 `1`，PretrainedConfig 是 `None`",
+      "两个都是 `None`",
+      "两个都是 `1`",
+      "MiniMindConfig 是 `None`，PretrainedConfig 是 `1`"
+    ],
+    "answer": [0],
+    "explain": "看实验表格 `bos_token_id` 那一行的第 2、3 列。`super().__init__(**kwargs)` 跑完时父类已经把 `self.bos_token_id` 设成了它自己的默认值 `None`；紧接着 L19 的 `self.bos_token_id = kwargs.get(\"bos_token_id\", 1)` 又读了一遍 MiniMindConfig 自己那份**没被消耗过**的 `kwargs`，用 `1` 把 `None` 覆盖掉。第 4 列说明这个覆盖不会吃掉调用方显式传进来的值。",
+    "ref": "model/model_minimind.py#L13-L19"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`input_ids` 是 `[B=3, T=7]`。`torch.equal(embed_tokens(input_ids), embed_tokens.weight[input_ids])` 的结果是？",
+    "options": [
+      "`False`：`nn.Embedding.forward` 之后还会乘一个 `sqrt(hidden_size)` 的缩放",
+      "`True`：`nn.Embedding` 的前向就是按行号取 `weight`，没有任何别的运算",
+      "`False`：形状对不上，前者是 `[3, 7, 768]`，后者是 `[3, 7, 6400, 768]`",
+      "报错：`weight` 是二维张量，不能用一个二维整数张量当下标"
+    ],
+    "answer": [1],
+    "explain": "看实验最后两行 print：`True`、`True`。`nn.Embedding` 没有矩阵乘法，`F.embedding` 就是高级索引 `weight[ids]`——用 `[3,7]` 的整数张量去索引 `[6400, 768]` 的第 0 维，结果是 `[3, 7, 768]`（下标张量的形状 + 被索引行的形状）。选项 A 是把 Transformer 原始论文里 `sqrt(d_model)` 的缩放记到 `nn.Embedding` 头上了，MiniMind 和 LLaMA 都没有这一步。",
+    "ref": "model/model_minimind.py#L201"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "在模块调用树里，从 `embed_tokens` 的输出，到每个 `MiniMindBlock` 的输入/输出，再到最后 `norm` 的输出，这条链上一共出现过几种不同的 shape？",
+    "options": [
+      "1 种：全程 `[B, T, C]`",
+      "2 种：进 FFN 时会变成 `[B, T, I]`，出来再变回去",
+      "L+1 种：每写回一次残差流就宽一点",
+      "3 种：`[B, T, C]` → `[B, T, H, D]` → `[B, T, C]`"
+    ],
+    "answer": [0],
+    "explain": "看调用树里每个 `MiniMindBlock` / `RMSNorm` 节点的「输入 → 输出」，全是 `[B=3, T=7, C=768]`。`[B,T,I=2432]`（选项 B）和 `[B,T,H=8,D=96]`（选项 D）确实出现了，但它们在 `mlp.gate_proj` / `self_attn.q_norm` 这些**更深一层的子模块**里，进出 Block 的那根「总线」本身宽度从没变过。",
+    "ref": "model/model_minimind.py#L221-L230"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "`self.register_buffer(\"freqs_cos\", freqs_cos, persistent=False)` 之后，`freqs_cos` 会出现在 `model.state_dict()` 里吗？`model.model.named_buffers()` 里呢？",
+    "options": [
+      "`state_dict()` 里没有，`named_buffers()` 里有",
+      "两个里面都有",
+      "两个里面都没有——`persistent=False` 等于根本没注册成 buffer",
+      "`state_dict()` 里有，`named_buffers()` 里没有"
+    ],
+    "answer": [0],
+    "explain": "看实验前三行 print：`named_buffers()` 里是 `['freqs_cos', 'freqs_sin']`，而进了 `state_dict()` 的是**空列表**，`state_dict()` 里带 `freqs` 的 key 数是 0。`persistent=False` 只影响「要不要写进/读出 `state_dict()`」，完全不影响它是不是 buffer、能不能参与 forward——`forward` 里照样 `self.freqs_cos[start_pos:start_pos+seq_length]` 地切片用。好处：这张 12.6 MB 的表不进 checkpoint，而且 `load_state_dict(strict=True)` 时不要求权重文件里有这两个 key。",
+    "ref": "model/model_minimind.py#L206-L207"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`x` 是 `[3, 7, 768]`。`x.pow(2).mean(-1, keepdim=True)` 的 shape 是什么？",
+    "options": [
+      "`[3, 7, 768]`：mean 不改变形状",
+      "`[1, 7, 768]`：沿 batch 维求均值",
+      "`[3, 1, 768]`：沿 T 维求均值，也就是「在这句话的所有 token 上」归一化",
+      "`[3, 7, 1]`"
+    ],
+    "answer": [3],
+    "explain": "看实验里 `x.pow(2).mean(-1, keepdim=True)` 这个子表达式后面标出来的 shape：`[B=3, T=7, 1]`。`-1` 是最后一维 `C`，所以归一化是**每个 token 独立**做的，和 batch 里的其他句子、句子里的其他 token 都无关（选项 C 是最常见的误解）。`keepdim=True` 把被压掉的那一维保留成 `1`，接下来的 `+ eps`、`rsqrt(...)` 也都是 `[B,T,1]`，最后 `x * rsqrt(...)` 靠广播回到 `[B,T,C]`——这就是 `norm` 的 return 那一行显示 `[B=3, T=7, C=768]` 的原因。",
+    "ref": "model/model_minimind.py#L57"
+  },
+  {
+    "id": "p7",
+    "type": "single",
+    "question": "`RMSNorm.forward` 去掉 `.float()`，让 `x.pow(2).mean(-1)` 全程留在 fp16 里算。当输入大到 `|x| ≥ 256`（fp16 上限 65504，256² = 65536 就溢出）时，对应 token 的输出会变成什么？",
+    "options": [
+      "变成 `nan`，并沿着后面所有层继续传播",
+      "抛 `OverflowError`，程序直接中止",
+      "静默地变成全 0：`mean` 里混进 `inf`，`rsqrt(inf) = 0`，`x * 0 = 0`，全程不报错",
+      "PyTorch 自动把溢出值截断成 65504，结果基本不受影响"
+    ],
+    "answer": [2],
+    "explain": "看实验表格的四行：`x.pow(2)` 里有几千个 `inf`；`rsqrt(inf) = 0.0`（**不是 nan**，这是关键）；不 `.float()` 时 21 个 token 全部输出全 0；「输出里有 nan 吗」是 `False`。所以这是一个不报错、不 nan、跑完一切正常、只是某些 token 的表示被悄悄清零的 bug——比直接崩溃难查得多。真实实现先升到 fp32，同一份输入全 0 行数是 0。",
+    "ref": "model/model_minimind.py#L60"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "`build_model(num_hidden_layers=2)` 这个模型里有几个 `RMSNorm` 实例？其中 `q_norm.weight` 的长度是多少？",
+    "options": [
+      "5 个；`q_norm.weight` 长 96",
+      "9 个；`q_norm.weight` 长 96",
+      "9 个；`q_norm.weight` 长 768（所有归一化都作用在整条残差流上）",
+      "3 个；`q_norm.weight` 长 768"
+    ],
+    "answer": [1],
+    "explain": "看实验表格：2 层共 **9** 行 = 每层 4 个（`input_layernorm` / `post_attention_layernorm` / `q_norm` / `k_norm`）+ 最后一个 `model.norm`，公式是 `4L + 1`。「5」是**种类**数不是实例数（选项 A 的坑）。`q_norm`/`k_norm` 是 Qwen3 风格的 QK-Norm，作用在每个 head 内部，所以宽度是 `D = head_dim = 96` 而不是 `C = 768`——表格第 2、3 列直接对照着看。",
+    "ref": "model/model_minimind.py#L104-L105"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "`q_norm` 作用在 `[B, T, H, D] = [3, 7, 8, 96]` 上。如果把它从 `RMSNorm(self.head_dim)` 改成 `RMSNorm(config.hidden_size)`，会发生什么？",
+    "options": [
+      "正常运行，只是多了 768-96=672 个用不上的参数",
+      "正常运行，PyTorch 会自动把 `weight` 截断到 96",
+      "在 `forward` 的 `self.weight * self.norm(...)` 那一步报 RuntimeError：`weight` 长 768，和最后一维 96 广播不上",
+      "在 `norm` 的 `mean(-1)` 那一步报错，因为 `dim` 和张量维数对不上"
+    ],
+    "answer": [2],
+    "explain": "`RMSNorm.norm` 里的 `mean(-1)` 不看 `self.weight`，所以 L57 不会报错；出问题的是 L60 的 `self.weight * self.norm(...)`：`[768]` 要和 `[3,7,8,96]` 的最后一维广播，96 ≠ 768 且都不是 1。实测报 `RuntimeError: The size of tensor a (768) must match the size of tensor b (96) at non-singleton dimension 3`。换句话说，`RMSNorm(dim)` 的 `dim` 必须等于输入的**最后一维**，它决定的是 `weight` 的长度，而不是「沿哪一维归一化」——后者永远是 `-1`。",
+    "ref": "model/model_minimind.py#L59-L60"
+  },
+  {
+    "id": "p11",
+    "type": "single",
+    "question": "用真实的 `pretrain_768` 权重，残差流每个 token 的平均 L2 范数从「embed 之后」到「layer7 之后」大致是怎么变的？",
+    "options": [
+      "基本不变（一直在 1.3 附近）：残差连接是恒等映射，不改变尺度",
+      "单调下降：每层都做了归一化，越往后越接近 0",
+      "先涨后被拉回：中间涨到 30 多，最后的 `model.norm` 会把它拉回 `√C ≈ 27.7`",
+      "单调增长：约 1.3 → 36，涨了差不多 28 倍"
+    ],
+    "answer": [3],
+    "explain": "看实验表格最右边的「相对 embed」列：1.0 → 4.8 → 6.3 → 8.3 → 9.2 → 11.4 → 13.4 → 17.7 → **28.4**，几乎单调。这是 Pre-Norm 的固有特征：`input_layernorm` 归一化的是**喂给子层的那份副本**，而 `hidden_states += residual` 写回总线的增量本身没被归一化，所以每层只会往上叠。选项 C 的前半句对、后半句错——表格最后一行显示 `model.norm` 之后是 42.14，比 27.7 还大（RMSNorm 把 RMS 归一到 1 之后还要乘可学习的 `weight`）。",
+    "ref": "model/model_minimind.py#L192-L193"
+  },
+  {
+    "id": "p9",
+    "type": "single",
+    "question": "把 `tie_word_embeddings` 从默认的 `True` 改成 `False`，模型的总参数量会多出多少？",
+    "options": [
+      "0：共享只是起了两个名字，`parameters()` 本来就把这份权重数了两次",
+      "`hidden_size` = 768：只是多了一个 bias 大小的东西",
+      "`vocab_size * hidden_size` = 4,915,200",
+      "`2 * vocab_size * hidden_size` = 9,830,400"
+    ],
+    "answer": [2],
+    "explain": "看实验最后三行 print：`tie=True` 19,665,024 → `tie=False` 24,580,224，差 **4,915,200 = 6400 × 768**。`self.model.embed_tokens.weight = self.lm_head.weight` 让两个属性名指向**同一个** `nn.Parameter`（`is` 为 `True`、`data_ptr()` 相同），而 `named_parameters()` 按对象去重，所以 `'lm_head.weight' in dict(model.named_parameters())` 是 `False`，这份权重只被数一次。关掉 tie 之后它变成独立的一份，正好多出 `[V, C]` 这么大一个矩阵。",
+    "ref": "model/model_minimind.py#L242"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`tie_word_embeddings=True` 时训练一步，`loss.backward()` 之后 `embed_tokens.weight.grad` 里装的是什么？",
+    "options": [
+      "两条路径的梯度之和：查表那一路（只有出现过的 token 有梯度）和 `lm_head` 那一路（所有 V 行都有梯度），累加在同一个 `.grad` 上",
+      "只有查表那一路的梯度，`lm_head` 的梯度存在 `lm_head.weight.grad` 里，是另一个张量",
+      "`None`：共享权重不参与反向传播，需要手动同步",
+      "两条路径梯度的平均值，PyTorch 会自动除以 2"
+    ],
+    "answer": [0],
+    "explain": "`embed_tokens.weight` 和 `lm_head.weight` 是**同一个** `nn.Parameter` 对象，autograd 里它就是同一个叶子节点，被用了两次。反向传播时两条路径的梯度按加法累加到同一个 `.grad` 缓冲区上（实测 `embed.weight.grad is lm_head.weight.grad` 为 `True`）。这也是权重共享在训练上的实际含义：输入端的「这个 token 长什么样」和输出端的「打分时拿什么当分类器」被绑成了一件事。",
+    "ref": "model/model_minimind.py#L242"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "默认配置（C=768, L=8, V=6400）的 63.9M 参数里，占比最大的是哪一块？",
+    "options": [
+      "embedding（与 `lm_head` 共享一份），约 30%",
+      "attention 的 `q/k/v/o_proj`，约 45%",
+      "FFN 的 `gate/up/down_proj`，约 70%",
+      "所有 RMSNorm 的 `weight` 加起来，约 5%"
+    ],
+    "answer": [2],
+    "explain": "看实验表格的占比列：FFN **70.14%** > attention **22.15%** > embedding **7.69%** > 所有 norm **0.02%**。FFN 三个矩阵每层就是 `3·C·I = 3×768×2432`，而 attention 四个投影合起来是 `2·C·H·D + 2·C·KV·D`（k/v 因为 GQA 只有一半宽），所以 FFN 比 attention 大三倍多。选项 D 差了两个数量级——norm 的参数量是 `C` 的**一次方**项，在 `C²` 量级的投影面前可以忽略。",
+    "ref": "model/model_minimind.py#L140-L142"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "把 `num_hidden_layers` 从 8 加到 16（其余不变），embedding 在总参数量里的占比会怎么变？",
+    "options": [
+      "不变，仍是 7.69%：所有部分都按同样比例增长",
+      "涨到约 15%：层数翻倍，embedding 也跟着翻倍",
+      "涨到约 30%：深模型需要更大的词表",
+      "跌到约 4%：embedding 不随层数变，而 `layers` 部分近似线性翻倍"
+    ],
+    "answer": [3],
+    "explain": "`embed_tokens` 是 `[V, C]`，和 `L` 完全无关；`layers` 部分近似 `L × (每层参数)`。实测：L=8 总量 63.91M、embedding 7.69%；L=16 总量 122.91M、embedding **4.00%**（4,915,200 / 122,908,416）。反过来说，只有加宽（改 `hidden_size`）才会让 embedding 那一项跟着涨，但 FFN/attention 是 `O(C²)` 涨得更快，所以加宽时 embedding 占比同样是下降的。",
+    "ref": "model/model_minimind.py#L201-L203"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`MiniMindConfig(hidden_size=1024, num_attention_heads=16)`，`head_dim` 和 `intermediate_size` 都不传。这两个值分别是多少？",
+    "options": [
+      "`head_dim=96`（MiniMind 的固定值），`intermediate_size=3264`",
+      "`head_dim=64`，`intermediate_size=3264`",
+      "`head_dim=64`，`intermediate_size=2752`（8/3 惯例）",
+      "`head_dim=128`（1024 除以 8 个 query head），`intermediate_size=4096`"
+    ],
+    "answer": [1],
+    "explain": "`head_dim` 默认是 `self.hidden_size // self.num_attention_heads = 1024 // 16 = 64`（注意 L24 用的是 `self.num_attention_heads`，也就是上一行刚从 kwargs 里取出来的 16，不是默认的 8——选项 D 就是忽略了这一点）。`intermediate_size = ceil(1024·π/64)·64 = ceil(50.27)·64 = 51·64 = 3264`。选项 C 用的是 LLaMA 的 8/3 系数，MiniMind 用的是 π。",
+    "ref": "model/model_minimind.py#L24-L26"
+  },
+  {
+    "id": "q6",
+    "type": "multi",
+    "question": "关于「残差流是一条宽度为 C 的总线」这个比喻，下面哪些说法和源码一致？（多选）",
+    "options": [
+      "`hidden_states` 从 `embed_tokens` 的输出到 `model.norm` 的输入，shape 一直是 `[B, T, C]`，`C` 从未变过",
+      "每个子层都是「从总线上读一份（归一化后的）副本 → 算点东西 → 把结果加回总线」，`MiniMindBlock.forward` 里就是 `hidden_states += residual` 和 `hidden_states = hidden_states + self.mlp(...)`",
+      "`input_layernorm` 归一化的是残差流本身，所以每层开头总线都会被重新缩放到 RMS=1",
+      "`lm_head` 的输入宽度必须是 `C`，因为它读的就是这条总线的最后一个状态"
+    ],
+    "answer": [0, 1, 3],
+    "explain": "A 由模块调用树直接验证（每个 Block、每个 `RMSNorm` 的进出都是 `[B,T,C]`）。B 就是 L192-L193 两行。D 对：`lm_head = nn.Linear(hidden_size, vocab_size)`，`[B,T,C] → [B,T,V]`。C **错**——这是最容易踩的坑：`self.self_attn(self.input_layernorm(hidden_states), ...)` 里归一化的是传给子层的那个**临时副本**，`residual = hidden_states` 存的是**没归一化**的原值，加回去的也是它，所以总线本身在整个 8 层里从未被重新缩放（这正是 norm-growth 那个实验里范数单调增长的原因）。",
+    "ref": "model/model_minimind.py#L186-L194"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "默认配置（C=768, L=8, V=6400）下把 `tie_word_embeddings` 关掉，总参数量大约是多少？",
+    "options": [
+      "约 68.8M（63.9M + 4.9M）",
+      "还是 63.9M：`lm_head` 本来就单独存了一份",
+      "约 127.8M：整个模型翻倍",
+      "约 59.0M：少了共享带来的约束，反而更省"
+    ],
+    "answer": [0],
+    "explain": "实测：`sum(p.numel() for p in build_model().parameters())` = 63,912,192；`build_model(tie_word_embeddings=False)` = 68,827,392，差正好是 `V·C = 4,915,200`。这也说明在 MiniMind 这种小模型上，权重共享省掉的是总量的约 7%——词表越大、模型越小，这个比例越可观（换成 `vocab_size=32000` 时，embedding 一项就占到 29.4%）。",
+    "ref": "model/model_minimind.py#L241-L242"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "线上 fp16 推理时发现：某些长输入下，模型输出突然变成毫无关联的内容，但日志里没有任何报错、也没有 nan。排查发现是某个 norm 实现被人「优化」过。下面哪一处改动最符合这个现象？",
+    "options": [
+      "把 `rms_norm_eps` 从 `1e-6` 改成了 `1e-5`",
+      "把 `x.pow(2).mean(-1, keepdim=True)` 的 `keepdim` 改成了 `False`",
+      "把 `self.norm(x.float())` 里的 `.float()` 删掉了，理由是「省一次 dtype 转换」",
+      "把 `register_buffer(..., persistent=False)` 改成了 `persistent=True`"
+    ],
+    "answer": [2],
+    "explain": "这道题考的是「**静默**失败」这个关键词。B 会立刻抛 `RuntimeError`（768 和 7 广播不上），D 只是让 checkpoint 变大，A 只在第 6 位小数上有影响——三者都不会造成「没报错但输出错乱」。只有 C：残差流的范数随深度单调增长（norm-growth 实验里 layer7 之后平均范数已到 36，个别通道更大），长输入下越容易触到 `|x| ≥ 256`，`x.pow(2)` 在 fp16 里溢出成 `inf` → `rsqrt(inf) = 0` → 整个 token 被清零，程序照常跑完。",
+    "ref": "model/model_minimind.py#L60"
+  }
+]

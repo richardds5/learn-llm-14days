@@ -1,0 +1,297 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "MiniMind 默认 8 层配置下调用 `apply_lora(model, rank=64)`（每层命中 `q_proj`、`o_proj` 两个 768→768 的方阵），全模型新增的 LoRA 参数一共是多少个？",
+    "options": [
+      "786,432 —— 每个模块只算 `r · out_features` = 64×768，一共 16 个模块",
+      "393,216 —— 和 rank=16 时一样，rank 只改变中间维度、不改变参数量",
+      "1,572,864 —— 每个模块 `r · (in + out)` = 64×1536 = 98,304，一共 16 个模块",
+      "6,291,456 —— 每层 q/k/v/o 四个投影都会被注入，共 32 个模块"
+    ],
+    "answer": [2],
+    "explain": "一条 LoRA 旁路有两个矩阵：`A` 是 `[r, in]`、`B` 是 `[out, r]`，参数量是 `r·(in+out)`，不是只算一边。768→768、rank=64 时是 `64×(768+768) = 98,304`；默认 8 层里只有每层的 `q_proj`/`o_proj` 是方阵，共 16 个模块，合计 1,572,864。实测三个 rank 的全模型占比分别是 rank=4 → 0.154%、rank=16 → 0.611%（393,216 个）、rank=64 → 2.402%，严格线性。选项 D 的 32 个模块是错的：GQA 让 `k_proj`/`v_proj` 的输出是 `KV·D = 384`，不是方阵。",
+    "ref": "model/model_lora.py#L10-L11"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "`apply_lora(model)` 之后（还没训练），拿同一个输入跑一次前向，和 `apply_lora` 之前的 logits 相比是什么关系？",
+    "options": [
+      "逐比特相同：`torch.equal` 返回 `True`，差值张量的 min/max/mean/std 全是精确的 0",
+      "会有非常小的浮动，因为 `LoRA.A` 是 `std=0.02` 的高斯随机初始化",
+      "完全不同，模型新增了参数、计算图变了",
+      "无法比较，`apply_lora` 改变了 `q_proj` 的输出维度"
+    ],
+    "answer": [0],
+    "explain": "`LoRA.forward` 是 `self.B(self.A(x))`，而 `B.weight` 被 `zero_()` 成全零。矩阵乘法里只要有一个因子全零结果就是全零，所以不管 `A` 抽到什么随机数，旁路输出恒等于 0 张量，`forward_with_lora(x) = original_forward(x) + 0`。实验里 `torch.equal(out_before, out_after)` 直接是 `True`，不是「差别很小」。选项 D 也不对：`LoRA` 的输出维度就是 `out_features`，和原 Linear 一致，否则根本加不起来。",
+    "ref": "model/model_lora.py#L14-L15"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "如果把 `LoRA.__init__` 里的 `A` 也改成 `zero_()`（`A`、`B` 都是全零），第一次反向传播之后会看到什么？",
+    "options": [
+      "只有 `A` 有梯度，`B` 没有",
+      "只有 `B` 有梯度，`A` 没有",
+      "会直接报错：`B(A(x))` 恒为常数 0，autograd 无法反传",
+      "`A` 和 `B` 的梯度都是全零，这一对永远学不动"
+    ],
+    "answer": [3],
+    "explain": "`dL/dB` 正比于中间量 `A(x)`，`dL/dA` 里带着 `B`。仓库的默认初始化是 `A` 随机、`B` 全零：此时 `A(x) ≠ 0`，所以 `B` 有梯度（实测 `grad B` 绝对值最大 1.8e-2），而 `A` 的梯度是 0，要等 `B` 离开 0 之后才开始动——这就是选项 B 描述的真实情况。但两个都置零时 `A(x)` 也是 0，两边的梯度同时为零（实测两个 `.grad.abs().max()` 都是 0.0），这一对就死在原点了。所以 ΔW 起步必须为 0，但只能有一个矩阵置零。autograd 本身不会报错，计算图是通的。",
+    "ref": "model/model_lora.py#L12-L15"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "把 `apply_lora` 的条件里 `and module.in_features == module.out_features` 删掉，只留 `isinstance(module, nn.Linear)`，其余一个字不改，然后对一个 2 层模型调用 `apply_lora(model)`，会发生什么？",
+    "options": [
+      "15 个 Linear 全被注入，LoRA 参数占比从 0.5% 涨到 4% 左右",
+      "循环能跑完，但前向时 `k_proj` 那一支会因为 shape 对不上而报错",
+      "直接 `RecursionError`：`named_modules()` 是懒生成器，刚 `setattr` 上去的 `lora.A` 自己也是 `nn.Linear`，会在同一轮循环里被继续注入",
+      "只有 `lm_head` 会因为 in/out 差得太远而报 shape 错，其余 14 个正常注入"
+    ],
+    "answer": [2],
+    "explain": "`named_modules()` 一边遍历一边产出：`q_proj` 被产出之后我们 `setattr` 挂上 `lora`，生成器接着去迭代 `q_proj._modules`，这时里面已经多了 `lora`，于是 `lora.A`（`Linear(768,16)`）也会被产出。没有方阵条件挡着，它同样被注入一个 LoRA，无限套娃，最后撞上 `RecursionError: maximum recursion depth exceeded`。实验最后那段复现直接把这个异常打了出来。把 `LoRA(...)` 换成 `nn.Identity()`（本身不是 `nn.Linear`，也没有 Linear 子模块）循环就能正常跑完 15 个——说明问题不在条件本身，而在「挂上去的东西又满足条件」。注意 shape 从来不是问题：`LoRA.__init__` 对 in ≠ out 完全能工作。",
+    "ref": "model/model_lora.py#L22-L25"
+  },
+  {
+    "id": "q4",
+    "type": "multi",
+    "question": "MiniMind 默认配置（`hidden_size=768`、`num_attention_heads=8`、`num_key_value_heads=4`）下，`apply_lora` 会给下面哪些模块注入 LoRA？（多选）",
+    "options": [
+      "`q_proj`（768 → 768）",
+      "`k_proj`（768 → 384）",
+      "`o_proj`（768 → 768）",
+      "`down_proj`（2432 → 768）",
+      "`lm_head`（768 → 6400）"
+    ],
+    "answer": [0, 2],
+    "explain": "条件是纯形状匹配 `module.in_features == module.out_features`。GQA 让 `k_proj`/`v_proj` 的输出是 `num_key_value_heads × head_dim = 4×96 = 384`，天生不是方阵；FFN 在 768 和 `intermediate_size=2432` 之间来回；`lm_head` 是 768→6400。只有 `q_proj` 和 `o_proj` 中签，2 层模型实测被注入 4 个、8 层 16 个。注意这不是「只想调 attention」的设计意图：把 `num_attention_heads` 改成 4（`head_dim` 变 192），`k_proj`/`v_proj` 也会变成 768→768 而被一并注入。",
+    "ref": "model/model_lora.py#L23"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`apply_lora` 之后不调用 `save_lora`，直接 `model.state_dict()`，返回的字典里会出现 `...q_proj.lora.A.weight` 这种 key 吗？",
+    "options": [
+      "不会：`lora` 是运行时 `setattr` 上去的，不是 `__init__` 里声明的属性，PyTorch 认不出来",
+      "会：`nn.Module.__setattr__` 对「赋值为 `nn.Module` 实例」有特殊处理，会自动注册进 `_modules`（2 层模型实测 key 数从 25 变成 33）",
+      "只有模型被 `DistributedDataParallel` 包装之后才会出现",
+      "会报错：属性名 `lora` 和 `LoRA` 类名冲突"
+    ],
+    "answer": [1],
+    "explain": "`nn.Module.__setattr__` 判断赋的值是不是 `nn.Module`，是的话就放进 `self._modules`——和在 `__init__` 里写 `self.lora = LoRA(...)` 效果完全一样，「运行时动态加」不影响这一点。于是 `named_modules()` / `named_parameters()` / `state_dict()` 全都能自动发现它们，`save_lora`/`load_lora`/`merge_lora` 才能只靠 `hasattr(module, 'lora')` 就把事情办完。实验里 2 层模型的 state_dict 从 25 个 key 变成 33 个，多出的 8 个正是 2 层 × 2 模块 × A/B。把 `setattr` 那一行删掉再跑，key 数就停在 25——前向依然正常，因为 `lora` 还被 `layer2=lora` 这个默认参数引用着。",
+    "ref": "model/model_lora.py#L25"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "用基于 forward hook 的工具（比如这门课的 `trace(model, ...)`）画 `apply_lora` 之后的模块调用树，`q_proj` 这个节点底下会看到什么？",
+    "options": [
+      "两个平级的子节点：原始 Linear 的那次矩阵乘法，和 `lora`",
+      "什么都没有——`forward` 被替换之后 hook 完全失效",
+      "只有原始 Linear；`lora` 因为是动态挂上去的，没有注册 hook",
+      "只有 `lora` 一个子节点：`layer1(x)` 是直接函数调用，绕过了 `nn.Module.__call__`，不触发 forward hook"
+    ],
+    "answer": [3],
+    "explain": "`forward_with_lora` 里 `layer1(x)`（即 `original_forward(x)`）是拿着原 Linear 的**绑定方法**直接调用，不经过 `nn.Module.__call__`，所以 PyTorch 的 forward hook 不会触发；而 `layer2(x)` 等价于 `lora.__call__(x)`，正常触发。`q_proj` 自己的 hook 仍然会触发（外层还是走 `__call__`），所以树里能看到 `q_proj → lora → A/B`，唯独「纯基座那次矩阵乘法」不作为独立节点出现。这是 monkey-patch 的一个真实盲点：profiler、可解释性工具都没法把基座贡献和 LoRA 贡献分开观测。",
+    "ref": "model/model_lora.py#L29-L30"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "把 `def forward_with_lora(x, layer1=original_forward, layer2=lora):` 的两个默认参数去掉，函数体改成直接引用外层的 `original_forward(x) + lora(x)`，其余不动。`apply_lora` 之后立刻跑一次前向（还没训练），会发生什么？",
+    "options": [
+      "完全没影响：Python 闭包会在每轮循环里各自拷贝一份当时的变量值",
+      "抛 `AttributeError`：闭包变量停在 `named_modules()` 遍历到的最后一个模块 `lm_head` 上，而它没有 `.lora`",
+      "不报任何错，但所有被 patch 的 `q_proj`/`o_proj` 都改用最后一个方阵 Linear（`layers.L-1.self_attn.o_proj`）的基座权重和 LoRA，logits 悄悄算错（max diff ≈ 4）",
+      "`apply_lora` 这一步就会报错，模型根本建不起来"
+    ],
+    "answer": [2],
+    "explain": "Python 闭包捕获的是变量本身（外层栈帧里的 cell），不是定义那一刻的值——这点没错，但关键在于 `original_forward`/`lora` 只在 `if` 分支**内部**被赋值。`lm_head` 是 768→6400，从来不满足条件，压根碰不到这两个变量；`module` 确实会走到 `lm_head`，可函数体根本没引用 `module`。所以循环结束后 cell 里留下的是最后一次进入 if 分支的值，也就是 `layers.L-1.self_attn.o_proj`。又因为 MiniMind 里所有被 patch 的方阵 Linear 形状完全相同（768→768），张冠李戴不会触发任何 shape 检查：实测 2 层模型 `torch.allclose` 为 `False`、max diff ≈ 3.99，8 层 ≈ 3.61，全程没有任何异常。「抛 `AttributeError`」是最容易中招的直觉错误。",
+    "ref": "model/model_lora.py#L26-L32"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "在「25 步之后哪些张量真的变了」这个实验里，跑完之后 `layers.0.self_attn.q_proj.weight` 相对训练前的最大变化量是多少？",
+    "options": [
+      "精确的 0.0：它的 `requires_grad` 是 `False`，既拿不到梯度，也不在 `optim.AdamW(lora_params, ...)` 的参数列表里",
+      "一个很小但非零的数（1e-8 量级），AdamW 的 weight decay 仍然会作用在它上面",
+      "和 `q_proj.lora.B` 的变化量相同，因为它们在同一个模块里",
+      "取决于 `clip_grad_norm_` 的阈值，阈值越大变化越大"
+    ],
+    "answer": [0],
+    "explain": "`train_lora.py` 做了两道保险：非 LoRA 参数 `requires_grad = False`（`.grad` 永远是 `None`），并且 optimizer 只收 `lora_params`，基座参数根本不在里面，weight decay 也就无从作用。实测 25 步之后 `(q.weight - w0).abs().max()` 是精确的 `0.0`，而同一模块的 `lora.B` 变了 2.5e-3。作为对照，把冻结那一支改成全参微调、optimizer 换成 `model.parameters()`，同样 25 步 loss 从 2.2 掉到 0.4（LoRA 只到 1.6 左右），代价是 `q_proj.weight` 也动了 1.9e-3。",
+    "ref": "trainer/train_lora.py#L139-L152"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "在一个**没有**调用过 `apply_lora` 的模型上直接 `load_lora(model, 'out/lora_identity_768.pth')`，会发生什么？",
+    "options": [
+      "抛 `KeyError` / `RuntimeError`，因为找不到对应的 `lora` 子模块",
+      "会自动创建 `lora` 子模块并把 A/B 填进去",
+      "不报错，也什么都不做：`load_lora` 遍历 `named_modules()` 找 `hasattr(module, 'lora')`，一个都不命中，模型输出一个比特都不会变",
+      "会把 `B @ A` 直接加到 `q_proj.weight` 上（相当于自动 merge）"
+    ],
+    "answer": [2],
+    "explain": "`load_lora` 的循环体整个包在 `if hasattr(module, 'lora'):` 里面，没有 `apply_lora` 就没有任何模块有 `lora` 属性，循环空转一遍结束——`torch.load` 成功了，权重却一个都没被用上，**静默无操作**。实测前后 `torch.equal(before, after)` 为 `True`。这也是 `eval_llm.py` 里必须先 `apply_lora(model)` 再 `load_lora(...)` 的原因：`load_lora` 只填值、不建结构。自动 merge 是 `merge_lora` 的活，它会先 `load_lora` 再把 `B @ A` 加进 `weight`。",
+    "ref": "model/model_lora.py#L39-L42"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "`merge_lora` 存出来的权重用 `strict=True` 加载进一个干净模型，再和「基座 + 旁路」的前向对比，实测结果是？",
+    "options": [
+      "`atol=1e-4` 就能 `allclose`——矩阵加法在数学上是精确的",
+      "形状根本对不上：`B.weight @ A.weight` 得到的是 `[r, r]`",
+      "误差随 rank 线性增大，和存盘精度无关",
+      "`atol=1e-2` 能过、`atol=1e-3` 过不了（logits std ≈ 0.55 时 max diff ≈ 2.2e-3）；把 `save_lora` 和 `merge_lora` 里的 `.half()` 都去掉后误差降到 5e-6"
+    ],
+    "answer": [3],
+    "explain": "形状是对得上的：`B.weight` 是 `[out, r] = [768, 16]`，`A.weight` 是 `[r, in] = [16, 768]`，乘出来 `[768, 768]`，正好是 `module.weight` 的 shape。误差来自两处 `.half()`：`save_lora` 把 A/B 转 fp16 存盘，`merge_lora` 又把合并后的权重转 fp16。实测 max diff 2.2e-3，`atol=1e-2` 过、`atol=1e-3` 不过；全程保持 float32 之后误差掉到 5e-6，连 `atol=1e-5` 都能过——所以这是存盘精度的锅，不是算法问题，也和 rank 没有线性关系。",
+    "ref": "model/model_lora.py#L62-L64"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "`load_lora` 的实现（按 `f'{name}.lora.' in k` 过滤，再喂给**已经存在**的 `module.lora`）让下面哪件事成为可能？",
+    "options": [
+      "同一个 `apply_lora` 过的模型可以反复 `load_lora`，在多份 LoRA 权重之间来回切换，不必重建结构、也不必重新加载基座",
+      "不调用 `apply_lora` 也能把 LoRA 权重加载进模型",
+      "可以把多份 LoRA 权重叠加起来同时生效",
+      "可以在加载时顺便改变 rank（比如用 rank=32 的文件填进 rank=16 的结构）"
+    ],
+    "answer": [0],
+    "explain": "`load_lora` 只覆盖数值、不碰结构，所以 `apply_lora` 一次之后可以反复调用它来热插拔——实验里同一个 `full_sft` 基座先挂 `lora_identity_768.pth`（「我叫 MiniMind」），再直接 `load_lora` 一次 `lora_medical_768.pth` 就切成了医学腔，中间不需要任何重建。选项 B 见 q8：没有 `apply_lora` 就是静默无操作。选项 C 错在 `load_state_dict` 是覆盖不是累加。选项 D 错在 rank 不同时 A/B 的 shape 对不上，`load_state_dict` 会抛 size mismatch。",
+    "ref": "model/model_lora.py#L35-L42"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`F.kl_div(input, target)` 对两个参数的约定是什么？`distillation_loss` 里实际传的是哪两个？",
+    "options": [
+      "`input` 是普通概率、`target` 是 log 概率；源码传 `(teacher_probs, student_log_probs)`",
+      "`input` 必须是 log 概率、`target` 是普通概率；源码传 `(student_log_probs, teacher_probs)`",
+      "两个参数都必须是 log 概率",
+      "两个参数都是普通概率，函数内部自己取 log"
+    ],
+    "answer": [1],
+    "explain": "`F.kl_div` 算的是 $\\mathrm{KL}(\\text{target} \\,\\|\\, \\exp(\\text{input}))$，所以第一个参数必须已经过 `log_softmax`、第二个是普通概率。源码里正是 `F.kl_div(student_log_probs, teacher_probs, reduction=reduction)`——被拟合的目标是 teacher。两个参数对调**不会报错**，只会安静地返回 `nan`（`log_softmax` 的输出是负数，被当成概率再取 log 就炸了），是个很难查的 bug。",
+    "ref": "trainer/train_distillation.py#L31-L35"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`train_epoch` 传给 `distillation_loss` 的是已经展平并过滤后的 `[M, V]`（M = 这个 batch 里参与蒸馏的有效 token 数）。把 `reduction` 从 `'batchmean'` 改成 `'sum'`，返回值会变成原来的几倍？",
+    "options": [
+      "不变，`batchmean` 和 `sum` 对二维输入等价",
+      "V 倍（6400）",
+      "M · V 倍",
+      "M 倍"
+    ],
+    "answer": [3],
+    "explain": "`'batchmean'` 是「先 `sum` 再除以输入张量的第 0 维长度」，对 `[M, V]` 来说分母就是 `M`。所以换成 `'sum'` 正好差 `M` 倍——实测 M=21 时 `sum` 是 `batchmean` 的 21.0000 倍。顺带一提 `'mean'` 是除以元素总数 `M·V`，比 `batchmean` 还小 6400 倍（实测比值 0.0002），量级完全跑偏，这也是 KL 散度场景下必须用 `batchmean` 而不是 `mean` 的原因。",
+    "ref": "trainer/train_distillation.py#L84-L88"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "温度从 `T=1` 升到 `T=4`，teacher 的 `softmax(z/T)` 被拉得很平，`F.kl_div` 算出来的裸 KL 会明显变小。那么 `distillation_loss` 真正返回的 `T² · KL` 会怎样？",
+    "options": [
+      "基本不变：三个温度下都落在 9 附近",
+      "跟着一起塌，大约也掉到原来的 1/15",
+      "反过来暴涨，`T=4` 时是 `T=1` 的 16 倍",
+      "变成负数，因为分布越平 KL 越容易穿过 0"
+    ],
+    "answer": [0],
+    "explain": "实测同一对 logits：裸 KL 是 8.6322（T=1）→ 2.2695（T=2）→ 0.5656（T=4），掉了 15 倍；而 `T² · KL` 是 8.6322 → 9.0778 → 9.0504，基本不动。这正是 Hinton 蒸馏论文里乘 `T²` 的用意——升温会把损失以及它对 logits 的梯度一起压小，乘回 `T²` 把损失量级拉回同一个尺度，于是换温度时不必跟着重调学习率、也不必重新平衡 `alpha`。KL 散度恒 ≥ 0，不会变成负数（teacher 和 student 完全相同时实测是 -6e-9，纯粹是浮点误差）。",
+    "ref": "trainer/train_distillation.py#L36"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "把 `student_logits = res.logits[..., :-1, :]` 的切片去掉（保留最后一个位置），其余不动，最先在哪一步出问题？",
+    "options": [
+      "`F.cross_entropy` 会因为 batch 维对不上而报错",
+      "`student_logits.view(-1, V)[loss_mask_flat == 1]` 抛 `IndexError`：mask 长度是 `B·(T-1) = 381`，而被索引的张量有 `B·T = 384` 行",
+      "不会报错，只是多蒸馏了一个位置",
+      "teacher 那边的 `teacher_logits[..., :vocab_size_student]` 切片会先失败"
+    ],
+    "answer": [1],
+    "explain": "`loss_mask` 是从 `labels[..., 1:]` 算出来的，长度天然比 `T` 少 1；`student_logits` 不切片就还是 `T` 个位置。展平之后布尔索引要求 mask 的长度等于被索引张量的第 0 维，于是报 `IndexError: The shape of the mask [381] at index 0 does not match the shape of the indexed tensor [384, 6400] at index 0`。选项 D 不对：`[..., :vocab_size_student]` 切的是最后一维（词表），和序列长度无关，当前 teacher/student 共用 6400 词表时它本来就是 no-op。",
+    "ref": "trainer/train_distillation.py#L84-L86"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "对比 `train_lora.py` 和 `train_distillation.py` 里 optimizer 和 `clip_grad_norm_` 收的参数范围，正确的是？",
+    "options": [
+      "两边都是 `model.parameters()`，写法完全一样",
+      "LoRA 收 `model.parameters()`，蒸馏收 `teacher_model.parameters()`",
+      "LoRA 收手动收集的 `lora_params`，蒸馏收整个 `model.parameters()`（student 是全参在训练）",
+      "蒸馏同时收 student 和 teacher 的参数，好让两个模型互相靠拢"
+    ],
+    "answer": [2],
+    "explain": "`trainer/train_lora.py` 里是 `optim.AdamW(lora_params, ...)` 和 `clip_grad_norm_(lora_params, args.grad_clip)`，`lora_params` 只收名字里带 `'lora'` 的那 393,216 个参数；`trainer/train_distillation.py:99` 和 `:214` 则是 `model.parameters()`——蒸馏训练的是一个完整（通常更小）的 student，不存在「只更新一小撮」。teacher 全程 `eval()` + `requires_grad_(False)`，前向还包在 `torch.no_grad()` 里，连计算图都不建，更谈不上被裁剪或优化。",
+    "ref": "trainer/train_distillation.py#L97-L102"
+  },
+  {
+    "id": "q15",
+    "type": "multi",
+    "question": "下面哪些说法同时符合 `train_lora.py` 和 `train_distillation.py` 的实现？（多选）",
+    "options": [
+      "两者都用 Day 8 学过的 `SFTDataset`，label 里 `-100` 标的是 prompt 和 padding 位置",
+      "两者都只更新模型里一小部分参数",
+      "两者都是仓库自己手写的实现，不依赖 peft 之类的第三方封装",
+      "两者在 `use_compile=1` 时都会被强制关掉 `torch.compile`"
+    ],
+    "answer": [0, 2],
+    "explain": "A 正确：两个脚本都是 `SFTDataset(args.data_path, tokenizer, max_length=...)`，同样的对话模板、同样的 `-100` label mask。C 正确：README 特意强调 LoRA 和白盒蒸馏都是手写的。B 错：只有 LoRA 冻结基座，蒸馏把整个 student 交给 optimizer。D 错：只有 `train_lora.py` 因为 monkey-patch 的 `forward` 和图捕获不兼容而强制 `args.use_compile = 0`（`trainer/train_lora.py:164-166`）；`train_distillation.py` 在 `use_compile=1` 时照样 `model = torch.compile(model)`。",
+    "ref": "trainer/train_lora.py#L164-L166"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "MiniMind 默认 8 层、rank=16，`apply_lora` 之后 `save_lora` 存盘。生成的文件里有多少个 key、一共多少个数？",
+    "options": [
+      "16 个 key、196,608 个数",
+      "32 个 key、393,216 个数",
+      "32 个 key、786,432 个数",
+      "64 个 key、393,216 个数"
+    ],
+    "answer": [1],
+    "explain": "8 层 × 每层 2 个方阵 Linear（`q_proj`/`o_proj`）= 16 个模块，每个模块存 `A.weight` 和 `B.weight` 两个 key，共 32 个；参数量 16 × 16×(768+768) = 393,216 个数。官方发布的 `out/lora_identity_768.pth` 实测就是 32 个 key、393,216 个数、`torch.float16`、797,278 字节（≈779 KB，正好每个数 2 字节再加一点元信息）。把 `save_lora` 里的 `.half()` 去掉保留 fp32，体积会翻倍到 1.5 MB 上下；2 层小模型上实测则是 195 KB → 387 KB。",
+    "ref": "model/model_lora.py#L45-L53"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "直接构造 `LoRA(in_features=768, out_features=384, rank=16)`（比如想强行给 `k_proj` 也加一条旁路），能正常构造并前向吗？",
+    "options": [
+      "不能：`LoRA.__init__` 里有 in == out 的断言",
+      "能构造，但前向时 `self.B(self.A(x))` 会因为 shape 对不上而报错",
+      "能，但参数量会变成 `16 × 768 × 384`",
+      "能：`A` 是 `Linear(768,16)`、`B` 是 `Linear(16,384)`，`B @ A` 得到 `[384, 768]`，和 `k_proj.weight` 同形；in/out 相不相等只是 `apply_lora` 自己加的筛选条件"
+    ],
+    "answer": [3],
+    "explain": "`LoRA.__init__` 只是 `A = nn.Linear(in_features, rank)`、`B = nn.Linear(rank, out_features)`，对 in、out 是否相等毫无要求，参数量依然是 `r·(in+out) = 16×1152 = 18,432`。方阵条件完全是 `apply_lora` 那一行 `and module.in_features == module.out_features` 加的，属于「用形状相等来简化要不要注入的决策」，不是 `LoRA` 本身的限制。这也是为什么 peft 能给 `k_proj`、`gate_proj` 这些非方阵层照样加 LoRA。",
+    "ref": "model/model_lora.py#L7-L11"
+  },
+  {
+    "id": "q18",
+    "type": "multi",
+    "question": "下面关于 teacher 的说法，哪些和 `train_distillation.py` 的实现一致？（多选）",
+    "options": [
+      "teacher 的前向被包在 `torch.no_grad()` 里，整条计算图都不会被建出来",
+      "teacher 也会被 `clip_grad_norm_` 裁剪，只是阈值和 student 不同",
+      "`teacher_model.eval()` 在当前 `MiniMindConfig` 默认 `dropout=0.0` 下不改变任何数值，纯属防御性写法",
+      "teacher 和 student 必须层数相同，脚本没有提供分开配置的入口"
+    ],
+    "answer": [0, 2],
+    "explain": "A 正确：`with torch.no_grad(): teacher_logits = teacher_model(input_ids).logits[...]`，再加上外面的 `requires_grad_(False)`，teacher 不建图也不攒梯度。C 正确：默认 `dropout=0.0` 时 `train()`/`eval()` 的前向数值一模一样，`eval()` 是给 dropout>0 或未来别的训练态敏感层兜底。B 错：只有 student 被裁剪，teacher 根本没有梯度。D 错：`--student_hidden_size`/`--student_num_layers` 和 `--teacher_hidden_size`/`--teacher_num_layers` 是四个独立参数，分别构造成两份 `MiniMindConfig`，脚本开头的注释写的就是「用 MoE 模型蒸馏 dense 模型」这种异构场景。",
+    "ref": "trainer/train_distillation.py#L163-L170"
+  }
+]

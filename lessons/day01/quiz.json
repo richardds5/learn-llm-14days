@@ -1,0 +1,282 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`dataset/lm_dataset.py` 里的 `SFTDataset` 要把一条 jsonl 变成 `input_ids` / `labels`，它需要一个 tokenizer。这份 tokenizer 的两个产物文件（`tokenizer.json` / `tokenizer_config.json`）放在仓库的哪个目录？",
+    "options": [
+      "`dataset/`，和语料放在一起",
+      "`model/`，和 `model_minimind.py` 放在一起",
+      "`trainer/`，因为它们是 `train_tokenizer.py` 产出的",
+      "`out/`，和 `.pth` 权重放在一起"
+    ],
+    "answer": [1],
+    "explain": "看实验表格第一行：`model/` 除了结构定义，还放着 tokenizer 的两份产物——因为它们和权重一样属于「模型的一部分」，换一套就等于换一个模型。`learnkit` 的 `get_tokenizer()` 干的就是 `AutoTokenizer.from_pretrained(\"model\")`。`trainer/train_tokenizer.py` 只是**生产**它们的脚本，而且默认输出到 `../model_learn_tokenizer/`，并不覆盖 `model/`。",
+    "ref": "trainer/train_tokenizer.py#L8"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "用 `--hidden_size 512 --use_moe 1` 跑 `train_full_sft.py`，其余参数不动。产出的权重文件叫什么？",
+    "options": [
+      "`out/full_sft_512.pth`",
+      "`out/full_sft_moe_512.pth`",
+      "`out/full_sft_512_moe.pth`",
+      "`out/sft_512_moe.pth`"
+    ],
+    "answer": [2],
+    "explain": "源码里那行 f-string 是 `f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'`（train_full_sft.py:64），拼接顺序是 **前缀 → `_hidden_size` → `_moe`**，`_moe` 在最后（排除 B）。前缀是 `--save_weight` 的默认值 `full_sft`，不是 `sft`（排除 D）。实验里把 `HIDDEN` 改成 512、`MOE` 改成 `'_moe'` 就能看到这一行，同时会发现 `out/` 里一个都对不上——这正是换 `hidden_size` 之后加载不到权重的原因。",
+    "ref": "trainer/train_full_sft.py#L63-L64"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "调用树里 `model.layers.0 <MiniMindBlock>` 这一行写着 `position_embeddings=tuple(cos=[T=7, D=96] float32, sin=[T=7, D=96] float32)`。该怎么读？",
+    "options": [
+      "这个模块被调用了两次，一次传 cos、一次传 sin",
+      "`position_embeddings` 是一个 `[2, T, D]` 的张量，工具把第一维拆开显示了",
+      "`cos` 和 `sin` 是 `MiniMindBlock.forward` 的两个关键字参数，`tuple` 只是它们的类型注解",
+      "传进去的这个实参本身是一个 python tuple，里面装着两个 `[T, D]` 张量，元素名 `cos` / `sin` 来自解包它的那一行代码"
+    ],
+    "answer": [3],
+    "explain": "`tuple( … )` 表示**这个值本身是一个 python tuple**（如果是 list 就显示 `list( … )`），括号里列的是它的各个元素。这一对张量在 `MiniMindModel.forward` L219 被打包成 `(self.freqs_cos[...], self.freqs_sin[...])`，`MiniMindBlock.forward` 的第二个形参就叫 `position_embeddings`（L186）；而 `cos` / `sin` 这两个元素名，来自真正解包它的 `Attention.forward` L118：`cos, sin = position_embeddings`，工具照着回填。它不是一个 `[2,T,D]` 张量（选项 B），两个张量只是恰好 shape 相同、各自独立。",
+    "ref": "model/model_minimind.py#L219"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "同一棵调用树里，`model.layers.0 <MiniMindBlock>` 的返回是 `→ tuple(hidden_states=[B=3, T=7, C=768] float32, present_key_value=None)`。`present_key_value` 为什么是 `None`？",
+    "options": [
+      "因为这次调用传的是 `use_cache=False`（树上同一层的 `self_attn` 那行就写着），`Attention.forward` 里 `past_kv = (xk, xv) if use_cache else None`",
+      "因为这是第 0 层，只有最后一层才会返回 KV cache",
+      "因为模型是随机初始化的，还没有产生过 KV cache",
+      "因为工具描述不了 KV cache 这种结构，所以统一显示成 `None`"
+    ],
+    "answer": [0],
+    "explain": "L123：`past_kv = (xk, xv) if use_cache else None`。调用树里 `model.layers.0.self_attn <Attention>` 那一行明确列出了 `use_cache=False`，所以每一层返回的都是 `None`，和第几层、权重是不是随机的都无关。顺带分清两个符号：`None` 是真的 `None`；`?`（比如 `presents=?`）表示「这个值里一个张量都没有，工具不描述它」——`presents` 是一个装了 8 个 `None` 的 list。返回的这个 tuple 对应 L194 的 `return hidden_states, present_key_value`。Day 7 打开 KV cache 之后，这里会变成一对 `[B, T, KV, D]`。",
+    "ref": "model/model_minimind.py#L123"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "实验里 prompt 有 `T=23` 个 token，`logits` 是 `[1, 23, 6400]`。这 23 个位置的预测目标里，有几个能在 prompt 内部找到「标准答案」？",
+    "options": [
+      "23 个，每个位置都能对照",
+      "1 个，只有最后一个位置真的在做预测",
+      "0 个，推理阶段没有标准答案可言",
+      "22 个，最后一个位置的目标还不存在"
+    ],
+    "answer": [3],
+    "explain": "位置 `t` 预测 `t+1`：`t = 0 … 21` 的目标就是 `input_ids` 里的第 1 … 22 个 token，实验表格的「真实 token[t+1]」列逐行列出了它们；只有 `t = 22` 的目标（第 24 个 token）还不存在，那正是要生成的。选项 B 是最常见的误解——其余 22 个位置**同样**在输出完整的 6400 维分布，只是答案已经写在 prompt 里了。训练时 `logits[..., :-1, :]` 配 `labels[..., 1:]`（L251）砍掉的就是这最后一个没有答案的位置。",
+    "ref": "model/model_minimind.py#L251"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`logits` 是 `[1, 23, 6400]`。想拿到「读完整段 prompt 之后，要生成的那个 token」的分布，应该怎么切？",
+    "options": [
+      "`logits[:, 0, :]`",
+      "`logits[-1, :, :]`",
+      "`logits[0, -1]`",
+      "`logits.mean(dim=1)`"
+    ],
+    "answer": [2],
+    "explain": "第 0 维是 batch（这里只有 1 条），第 1 维是位置，`-1` 取最后一个位置，剩下的 6400 维就是词表分布。`logits[:, 0, :]` 拿到的是「prompt 第一个 token 之后」的预测（实验表格 t=0 那一行）。`logits[-1, :, :]` 把本该用在时间维的 `-1` 错用在了 batch 维上——`B=1` 时不报错，但拿到的是 `[23, 6400]` 的整段序列，语义完全不对，这是很常见的手滑。`mean(dim=1)` 把 23 个位置的分数平均起来，没有任何语言模型意义。",
+    "ref": "model/model_minimind.py#L248"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "问「天空是什么颜色的？」，`logits[0, -1]` 的 top-1 是 `'天'`，概率高达 0.89——恰好是问题的第一个字。这说明什么？",
+    "options": [
+      "模型在复读输入：`logits[0, -1]` 给的其实是「prompt 的第一个 token」的概率",
+      "这是模型对整段 prompt 的打分，top-1 只是 prompt 里出现频率最高的那个 token",
+      "这是模型**回答**的第一个 token，恰好也是「天」字",
+      "prompt 的最后一个 token 是 `\\n`，模型没东西可依据，于是复制了前面出现过的实词"
+    ],
+    "answer": [2],
+    "explain": "看实验最后一行的贪心续写：`'天空的颜色因颜色的不同而有所差异，但通常可以分为以下几种：…'`。`logits[0, -1]` 永远是「读完整段 prompt 之后要生成的下一个 token」的分布，这里它是**回答**的第一个字；只是中文回答习惯先复述主语，才和问题首字撞上了。换成 task 1 里的「你叫什么名字？」，top-1 变成 `'我'`，续写是「我叫通义千问……」，没有任何重合。选项 A 是最常见的误读：位置 `t` 预测的是 `t+1`，prompt 的第一个 token 是输入，没有谁去预测它。",
+    "ref": "model/model_minimind.py#L248"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "把 `train_tokenizer.py` 里的 `VOCAB_SIZE` 改成 3200、其他一律不动并重训，`tokenizer.json` 里会有多少条 merges？",
+    "options": [
+      "3200 条",
+      "3054 条，正好是 6108 的一半",
+      "2908 条 = 3200 − 256 − 36",
+      "还是 6108 条，只是词表被截断到 3200"
+    ],
+    "answer": [2],
+    "explain": "`vocab_size` 是**总预算**而不是 merge 次数：`initial_alphabet`（256 个字节）和 `special_tokens`（36 个）都先从这个预算里扣掉，剩下的名额才拿去学 merge。6400 时是 `6400 − 256 − 36 = 6108`，实验直接数 `model/tokenizer.json` 验证过；3200 时同理是 2908。迷你 BPE 那个实验最后一行 print 的 `256 + (len(vocab) − 256)` 是同一条关系（它没传 `special_tokens`，所以只扣 256）。",
+    "ref": "trainer/train_tokenizer.py#L43-L48"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "MiniMind 的 tokenizer 把 `'我是谁'` 这三个汉字切成几个 token？",
+    "options": [
+      "1 个——这是个常见短语，BPE 会整体合并",
+      "3 个——每个汉字一个 token",
+      "4 个",
+      "9 个——ByteLevel 的粒度是字节，每个汉字 3 个字节"
+    ],
+    "answer": [2],
+    "explain": "实验表格是 4 行。`'我'`（id 463）和 `'是'`（id 357）各占一个 token——它们在训练语料里太常见，BPE 早就把各自的三个字节合并掉了；而 `'谁'` 相对低频，它的三个字节只合并出了 `'è°'`（前两个字节）和 `'ģ'`（第三个字节）两个 token，表格里这两行「单独 decode」都是 `'\\ufffd'`，要到「前 k 个一起 decode」那一列凑齐了才显出「谁」。所以「一个汉字 = 一个 token」从来不是保证（排除 B），而是高频字才有的福利；也不会退化成每字节一个（排除 D），那正是 merge 要解决的事。",
+    "ref": "trainer/train_tokenizer.py#L26"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "`tokenizer.convert_ids_to_tokens(463)` 返回 `'æĪĳ'`。下面哪个说法是对的？",
+    "options": [
+      "tokenizer 坏了，处理中文需要换一个支持 UTF-8 的实现",
+      "这是一个 `<unk>` 的显示形式，说明词表里没有「我」这个字",
+      "这是 latin-1 解码错误，`encode` 时应该显式指定 encoding",
+      "这是「我」的三个 UTF-8 字节各自的可打印替身被 merge 成的一个 token，decode 时会精确还原成 `'我'`"
+    ],
+    "answer": [3],
+    "explain": "`ByteLevel` 把 256 个可能的字节各映射到一个可打印的 unicode 字符（空格 → `Ġ`、换行 → `Ċ`）；「我」的 UTF-8 编码是三个字节，替身正好是 `'æ'` `'Ī'` `'ĳ'`，BPE 学会把这三个合并成一个 token（id 463）。实验表格里它的「单独 decode」列就是 `'我'`，往返一致性那行 print 是 `True`。ByteLevel 体系下根本不会出现 `<unk>`（排除 B）——任何字节都有对应 id，这正是它被选用的理由。",
+    "ref": "trainer/train_tokenizer.py#L25-L26"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "`tok.encode('<think>')` 得到什么？把结果拿去 `tok.decode(..., skip_special_tokens=True)` 又得到什么？",
+    "options": [
+      "`[25]`；`'<think>'`（原样保留）",
+      "`[25]`；`''`（被吃掉）",
+      "`['<', 'think', '>']` 三个 token；`'<think>'`",
+      "报错：`<think>` 必须配合 `add_special_tokens=True` 才能编码"
+    ],
+    "answer": [0],
+    "explain": "两件事要分开看。**encode**：`<think>` 在 `added_tokens` 里，tokenizer 会把它整体切出来，得到单个 id 25，不会拆成 `'<' + 'think' + '>'`（排除 C）——这一点和 `special` 是 True 还是 False 无关。**decode**：`train_tokenizer.py` L60-62 把不在 `special_tokens_list` 里的 15 个标记改回了 `special=False`，所以 `skip_special_tokens=True` 不会过滤它。实验最后两行 print 的对照很直观：`<|im_start|>` / `<|im_end|>` 消失了，`<think>` / `<tool_call>` 原样留着。",
+    "ref": "trainer/train_tokenizer.py#L60-L64"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "拿实验里那个用 40 行「自我介绍」语料训出来的迷你 BPE，去编码一句完全不相关的中文（比如一段医学描述），会发生什么？",
+    "options": [
+      "报错，因为词表里没有这些字",
+      "出现大量 `<unk>`，decode 回来是一堆问号",
+      "切分退化到接近单字节粒度、token 数变多，但 decode 仍然和原文完全一致",
+      "自动回退到官方那套 6400 的词表"
+    ],
+    "answer": [2],
+    "explain": "144 条 merge 学到的全是这份语料的高频片段（`' MiniMind'`、`' Jingyao'`、`'的人工智能助手'`），换个主题就没得合并，只能落回 `initial_alphabet` 里的单字节 token——token 数变多、压缩率变差。但 `initial_alphabet=pre_tokenizers.ByteLevel.alphabet()` 保证了 256 个字节全部有 id，所以既不会报错、也不会有 `<unk>`，`decode` 依然无损。这正是官方要在 10000 行更宽的语料上学 6108 次 merge 的原因：merge 的覆盖面直接决定真实文本的压缩率。",
+    "ref": "trainer/train_tokenizer.py#L46"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`messages = [{'role':'user','content':'你好'}, {'role':'system','content':'S'}]`——system 不在第一条。渲染结果里 `S` 去哪了？",
+    "options": [
+      "被丢掉了，模板只认 `messages[0]` 位置上的 system",
+      "被自动提到最前面，渲染成开头那个 system 段",
+      "原地渲染成一个普通回合 `<|im_start|>system\\nS<|im_end|>\\n`，跟在 user 后面",
+      "报错：system 必须是第一条消息"
+    ],
+    "answer": [2],
+    "explain": "模板开头只判断 `messages[0].role == 'system'`，所以 `S` 进不了开头的 system 段（这点选项 A 说对了一半）。但主循环里的条件是 `(message.role == \"user\") or (message.role == \"system\" and not loop.first)`——**不在第一条**的 system 会命中后半句，原地渲染成一个和 user 长得一模一样的普通回合。实验 task 1 就是把 system 挪到末尾来验证这件事。",
+    "ref": "trainer/train_tokenizer.py#L100"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "一条**完全没有**思考内容的普通 assistant 消息（`{'role':'assistant','content':'等于2'}`，content 里连 `<think>` 字样都没有），`apply_chat_template` 会把它渲染成什么？",
+    "options": [
+      "`<|im_start|>assistant\\n等于2<|im_end|>\\n`——没有思考内容就不渲染 think 标签",
+      "`<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n等于2<|im_end|>\\n`——一对空的 think 标签照样在",
+      "取决于位置：只有最后一条 assistant 会带 think，更早的历史轮次会被裁掉（和 Qwen3 一致）",
+      "抛异常：这条消息缺少 `reasoning_content` 字段"
+    ],
+    "answer": [1],
+    "explain": "看实验表格第一行。真正往外写字符串的那一行外面套的是恒真的 `{%- if true %}`，所以每条 assistant 消息都会被渲染成 `<think>\\n{reasoning}\\n</think>\\n\\n{content}` 这个固定骨架，`reasoning` 为空时就是一对空标签。选项 C 是最像真的一个误解：模板里确实留着一段从 Qwen3 移植来、反向遍历 messages 算 `ns.last_query_index` 的逻辑，但它的结果**从头到尾没被使用**，是一段死代码。",
+    "ref": "trainer/train_tokenizer.py#L100"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`apply_chat_template(..., add_generation_prompt=True)` 且**不传** `open_thinking` 时，渲染结果末尾拼上的是什么？",
+    "options": [
+      "`<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n`——一个闭合的空骨架",
+      "`<|im_start|>assistant\\n<think>\\n`——留一个开口，等模型自己写思考",
+      "`<|im_start|>assistant\\n`——不带任何 think 标签",
+      "什么都不拼，`add_generation_prompt` 只对带 tools 的调用生效"
+    ],
+    "answer": [0],
+    "explain": "模板末尾的条件是 `if open_thinking is defined and open_thinking is true`，不传就走 else 分支，把**闭合**的 `<think>\\n\\n</think>\\n\\n` 焊死在末尾（实验表格第 3 行）。这样模型的下一个待预测位置已经在 `</think>` 之后，只能直接写正文——这就是默认「关闭思考」的实现方式。选项 B 要显式传 `open_thinking=True` 才会出现（表格第 4 行），也就是 `eval_llm.py --open_thinking 1`。",
+    "ref": "trainer/train_tokenizer.py#L100"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "模型一次并行调用了 3 个工具，于是 messages 里连着出现 3 条 `{'role':'tool', ...}`。渲染结果里这 3 条会占几个回合？",
+    "options": [
+      "3 个回合，每条 tool 结果一个 `<|im_start|>tool` 段",
+      "1 个回合：3 段 `<tool_response>` 被裹进同一个 `<|im_start|>user` 里",
+      "3 个回合，每条各开一个 `<|im_start|>user`",
+      "0 个回合，tool 消息只在训练时保留，推理渲染时会被跳过"
+    ],
+    "answer": [1],
+    "explain": "模板里的两个条件是关键：只有 `loop.first or (messages[loop.index0 - 1].role != \"tool\")` 才开 `<|im_start|>user`，只有 `loop.last or (messages[loop.index0 + 1].role != \"tool\")` 才收 `<|im_end|>`。所以**连续**的 tool 消息共用一个 user 轮次，每条各占一段 `<tool_response>…</tool_response>`。实验里两条 tool 消息就只额外多出 1 个 user 轮次、2 段 `tool_response`（最后两行 print）。模板里压根没有 `<|im_start|>tool` 这种写法（排除 A）——tool 结果在模型眼里就是「用户又说话了」。",
+    "ref": "trainer/train_tokenizer.py#L100"
+  },
+  {
+    "id": "q14",
+    "type": "multi",
+    "question": "一句「你叫什么名字？」经过 chat_template + encode 之后 `input_ids` 是 `[1, 22]`，forward 一次。下面哪些说法正确？（多选）",
+    "options": [
+      "`logits` 的 shape 是 `[1, 22, 6400]`，6400 既是 `MiniMindConfig.vocab_size`，也是 tokenizer 的词表大小",
+      "想知道模型接下来要说什么，对 `logits[0, -1]` 做 softmax",
+      "这 22 个位置里，`<|im_start|>assistant` 之后那串固定骨架最容易被猜对",
+      "`logits[0, 0]` 预测的是 `input_ids[0, 0]` 自己"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "A 对：`lm_head = nn.Linear(hidden_size, vocab_size)`，最后一维就是词表大小，模型和 tokenizer 必须同一个数才对得上。B 对：最后一个位置才是「还没有答案」的那个。C 对：逐位置实验里 `ass` / `ist` / `ant` / `<think>` / `</think>` 那几行全是 ✓，因为 chat_template 把这段骨架写死了，模型在训练数据里见过无数遍；而 user 提问那几格几乎全错。D **错**：位置 `t` 预测的是 `t+1`，`logits[0, 0]` 预测的是 `input_ids[0, 1]`——去预测自己没有任何意义，因果掩码下位置 0 本来就看得见自己。",
+    "ref": "model/model_minimind.py#L248"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "下面哪一项改动会让手上的 `out/full_sft_768.pth` **直接失效**（能加载，但输出变成胡言乱语）？",
+    "options": [
+      "把 `eval_llm.py` 的 `--temperature` 从 0.85 改成 0.1",
+      "把 `--open_thinking` 从 0 改成 1",
+      "重新训练一套 tokenizer 并替换掉 `model/tokenizer.json`",
+      "把 `--max_new_tokens` 改小到 128"
+    ],
+    "answer": [2],
+    "explain": "温度只影响采样的锐利程度，`open_thinking` 只改 prompt 末尾拼什么，`max_new_tokens` 只决定生成多长——三者都不动权重。但换 tokenizer 会把「id ↔ 子词」的对应关系整体重排：`embed_tokens` 的第 463 行原本存的是「我」的词向量，换完之后这个 id 可能对应完全不相干的子词，整张 `[V, C]` 表全部对错号（而且 `vocab_size` 一变连加载都会失败）。`train_tokenizer.py` 第一行注释和 README 反复警告的就是这件事。",
+    "ref": "trainer/train_tokenizer.py#L1"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "同一个问题，把 `open_thinking` 从默认改成 `True` 之后再 forward，`logits[0, -1]` 预测的是什么？",
+    "options": [
+      "思考内容的第一个 token——prompt 末尾变成了未闭合的 `<think>\\n`",
+      "还是正文的第一个字，`open_thinking` 只影响采样策略",
+      "`logits` 的第 1 维不会变，因为 prompt 的长度和 `open_thinking` 无关",
+      "什么都预测不了：`<think>` 是 special token，不参与 forward"
+    ],
+    "answer": [0],
+    "explain": "`open_thinking=True` 时 prompt 末尾是未闭合的 `<think>\\n`，最后一个位置的下一个 token 自然就是思考内容的开头；默认时末尾是闭合的 `<think>\\n\\n</think>\\n\\n`，待预测位置已经在 `</think>` 之后，只能是正文。选项 C 正好说反了：实测同一句「天空是什么颜色的？」，默认渲染出 23 个 token，`open_thinking=True` 只有 19 个（少了 `\\n</think>\\n\\n` 那 4 个）。选项 D 也错——`special` 只影响 `skip_special_tokens` 时的 decode，任何 token 都是正常的 id、正常参与 forward，何况 `<think>` 的 special 早被改成了 `False`。",
+    "ref": "trainer/train_tokenizer.py#L100"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "你想快速看看「pretrain 之后、SFT 之前」的模型会怎么续写一句话。最省事的做法是？",
+    "options": [
+      "跑 `trainer/train_pretrain.py`，它跑完会打印几个样例",
+      "改 `model/model_minimind.py` 里的默认 config，再跑 `scripts/web_demo.py`",
+      "先用 `scripts/convert_model.py` 转成 transformers 格式，再用 `pipeline()`",
+      "`python eval_llm.py --weight pretrain`"
+    ],
+    "answer": [3],
+    "explain": "`eval_llm.py` 就是为这件事存在的：`--weight` 给权重前缀，配合 `--hidden_size` 按 `./{save_dir}/{weight}_{hidden_size}{_moe}.pth` 拼出路径（eval_llm.py:22），而 `out/pretrain_768.pth` 本地就有（实验表格「本地」列的第一行）。选项 A 会从头开始训练；B 平白改源码；C 的 `convert_model.py` 是为了把权重导出给 transformers 生态用的，绕了一大圈。",
+    "ref": "eval_llm.py#L22"
+  }
+]

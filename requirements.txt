@@ -1,0 +1,13 @@
+# learn-llm-14days 课程运行依赖（最小集，非 minimind 上游全量列表）
+# 测试环境：Python 3.10（macOS Apple Silicon），torch 在 Apple Silicon 上从 PyPI 直接装即可，无需额外索引/编译
+# transformers / tokenizers 锁定精确版本：generate / KV cache 的行为随版本变，锁死才能保证实验输出和课文一致
+transformers==4.57.6
+tokenizers==0.22.2
+torch>=2.6  # 测试用 2.14.0
+numpy>=1.26.4
+flask>=3.0.3
+PyYAML>=6.0.3
+datasets>=3.6.0
+openai>=1.59.6
+requests>=2.34.2
+huggingface_hub>=0.36.2  # scripts/download.py 用于拉取模型/数据

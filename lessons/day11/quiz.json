@@ -1,0 +1,324 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`DPODataset.__getitem__` 里写了 `x = input_ids[:-1]` / `y = input_ids[1:]` / `mask = loss_mask[1:]`，而 `SFTDataset` 直接返回等长的 `input_ids` 和 `labels`。为什么 DPO 要在 Dataset 里手动错位？",
+    "options": [
+      "因为偏好数据的序列天然比 SFT 长一个 token，必须裁掉一个",
+      "因为 SFT 走 `MiniMindForCausalLM.forward(labels=...)`，错位写在模型里（`logits[..., :-1, :]` 对 `labels[..., 1:]`）；DPO 只调 `model(x)`、不传 `labels`，那段代码根本走不到",
+      "因为 `torch.gather` 要求 index 比 input 少一维，`[1:]` 正好少一位",
+      "因为 DPO 的 mask 是 0/1 而不是 -100，需要整体左移一位才能和 padding 对齐"
+    ],
+    "answer": [1],
+    "explain": "`MiniMindForCausalLM.forward` 只有在传了 `labels` 时才执行 `x, y = logits[..., :-1, :], labels[..., 1:]` 并算交叉熵（model/model_minimind.py:250-252）。`train_dpo.py` 调的是 `model(x)`——没有 `labels`，拿到的是**未错位**的 `logits`，所以 `y` 必须由 Dataset 提前错开一位。C 错在把 gather 的维数要求和序列错位混为一谈：gather 要的是 `index` 和 `input` **维数相同**（靠 `unsqueeze(2)` 满足），和 `[1:]` 无关。",
+    "ref": "dataset/lm_dataset.py#L160-L165"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "`DPODataset(..., max_length=256)`，DataLoader 的 `batch_size=3`。`batch['mask_rejected']` 的 shape 是什么？",
+    "options": [
+      "`[3, 256]`，mask 不参与 `[1:]` 切片",
+      "`[6, 255]`，chosen 和 rejected 已经在 Dataset 里拼好了",
+      "`[3, 256, 6400]`，mask 要和 logits 对齐",
+      "`[3, 255]`"
+    ],
+    "answer": [3],
+    "explain": "`padding='max_length'` 把每条 padding 到 256，`mask_rejected = loss_mask[1:]` 砍掉一个位置 → 长度 255；DataLoader 再在前面加一维 batch → `[3, 255]`。实验表格里六个键的 shape 全是 `(3, 255)`。A 错在 mask 也走了 `[1:]`（dataset/lm_dataset.py:165）；B 错在拼接发生在 `train_epoch` 的 `torch.cat`，不在 Dataset 里；C 错在 mask 是 `[B, T]` 的 0/1 张量，从来不带 vocab 维。",
+    "ref": "dataset/lm_dataset.py#L165"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "如果照搬 SFT 的做法，把 prompt 和 padding 位置的 `y` 填成 `-100`（而不是另外维护一个 0/1 的 `mask`），第一次前向会发生什么？",
+    "options": [
+      "在 `torch.gather` 那一行抛 `RuntimeError: index -100 is out of bounds for dimension 2 with size 6400`",
+      "正常运行：`torch.gather` 会像 `ignore_index` 一样跳过负数索引，对应位置返回 0",
+      "在 `F.log_softmax` 那一行抛错，因为 log_softmax 不接受负的 label",
+      "正常运行但结果错误：-100 会被当成 Python 的负索引，取到倒数第 100 个 token 的 log prob"
+    ],
+    "answer": [0],
+    "explain": "`y` 在 DPO 里是 `torch.gather` 的**索引**，必须落在 `[0, V)`。实验最后一行实测报错正是 `index -100 is out of bounds for dimension 2 with size 6400`。D 是很有迷惑性的误解：Python 列表支持负索引，但 `torch.gather` 的 index 不支持，越界就报错（把 -100 换成 6400 会得到 `index 6400 is out of bounds…`，同一条检查的另一端）。B 错在 `ignore_index` 是 `F.cross_entropy` 的参数，gather 没有这个概念——这正是 DPO 必须把 mask 单独拿出来走一路的原因。",
+    "ref": "trainer/train_dpo.py#L30"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "把 `train_epoch` 里三行 `torch.cat` 的参数顺序全部对调（写成 `torch.cat([x_rejected, x_chosen], dim=0)` 等），`dpo_loss` 一个字不动。`dpo_loss` 里的 `chosen_policy_log_probs` 会变成什么？",
+    "options": [
+      "还是 chosen：`dpo_loss` 内部会根据 mask 的长度自动判断哪一半是 chosen",
+      "会抛 shape 不匹配的 `RuntimeError`，因为 `batch_size // 2` 切错了",
+      "变成 rejected 那一半——`[:batch_size // 2]` 只认行号，不认内容",
+      "变成 chosen 和 rejected 交错的混合，因为 `cat` 是按 `dim=0` 交织的"
+    ],
+    "answer": [2],
+    "explain": "`torch.cat(..., dim=0)` 是首尾相接、不是交织（D 错），所以上半边永远是第一个参数。`dpo_loss` 里 `[:batch_size // 2]` 纯粹按行号切（trainer/train_dpo.py:41-44），没有任何内容判断（A 错）；shape 也完全没变，不会报错（B 错）。于是 `chosen_*` 这四个变量里装的其实是 rejected——变量名还叫 chosen，这正是这个 bug 难发现的地方。",
+    "ref": "trainer/train_dpo.py#L65-L67"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`logits_to_log_probs` 里 `logits` 是 `[8, 1023, 6400]`、`labels` 是 `[8, 1023]`。如果把 `torch.gather(log_probs, dim=2, index=labels.unsqueeze(2))` 里的 `labels.unsqueeze(2)` 写成 `labels`，会发生什么？",
+    "options": [
+      "正常运行，broadcast 会自动补上缺的那一维，返回 `[8, 1023]`",
+      "正常运行，但返回 `[8, 1023, 6400]`，后面的 `.squeeze(-1)` 无效",
+      "`RuntimeError: Index tensor must have the same number of dimensions as input tensor`",
+      "返回 `[8, 1023, 1]`，`.squeeze(-1)` 之后和原来完全一样"
+    ],
+    "answer": [2],
+    "explain": "`torch.gather` 要求 `index` 和 `input` 的**维数**完全相同（只有被 gather 的那一维长度可以不同），它不做 broadcast。`log_probs` 是 3 维、`labels` 是 2 维，直接报 `RuntimeError: Index tensor must have the same number of dimensions as input tensor`（实验的第二条任务可以实测）。所以 `unsqueeze(2)` 先把它变成 `[8, 1023, 1]`，gather 出来也是 `[8, 1023, 1]`，再 `.squeeze(-1)` 回到 `[8, 1023]`。注意区分它和「`y` 里有 -100」那条 `index … is out of bounds` 的报错：一个是维数问题，一个是取值问题。",
+    "ref": "trainer/train_dpo.py#L30"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "在真实权重下，某条 chosen 有 26 个 `mask=1` 的 token、序列 log prob 是 −52.56；另一条 chosen 有 95 个、序列 log prob 是 −147.30。把 `(log_probs * mask).sum(dim=1)` 里的 `* mask` 去掉（`max_length=256`），第一条的序列 log prob 大概会变成什么量级？",
+    "options": [
+      "基本不变，padding 位置的 log prob 接近 0",
+      "掉到 −3000 量级：另外 200 多个 prompt / padding 位置的 log prob 全被加了进去",
+      "变成 `nan`，因为 padding 位置的 logits 是 `-inf`",
+      "变成正数，因为 padding token 的概率接近 1、log 接近 0 但会累积成正值"
+    ],
+    "answer": [1],
+    "explain": "`logits_to_log_probs` 返回的是每个位置的 $\\log p(y_t)$，**全都是有限的负数**——模型在 padding 位置照样吐出一个概率分布，log 之后是 −1 到 −10 量级的负数，而不是 0（A 错）、不是 `-inf`（C 错）、更不可能是正数（log 概率恒 ≤ 0，D 错）。实验的第一条任务实测：去掉 mask 之后六行分别是 −3004 / −2460 / −2462 / −2230 / −3032 / −2825。这也解释了为什么 mask 必须乘在求和之前。",
+    "ref": "trainer/train_dpo.py#L36"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "`--batch_size 8`、`--max_seq_len 1024`、`vocab_size=6400`、fp32。一份 `[2B, T, V]` 的 logits 占多少显存？",
+    "options": [
+      "约 210 MB",
+      "约 52 MB",
+      "约 105 MB",
+      "约 419 MB"
+    ],
+    "answer": [3],
+    "explain": "DPO 里进模型的行数是 `2 × batch_size = 16`：`16 × 1024 × 6400 × 4 B ≈ 419 MB`（实验表格 `batch_size=8` 那一行）。210 MB 是 `batch_size=4` 的答案，105 MB 是**忘了 ×2**（把它当成 SFT 的 `[B,T,V]`）的答案——这是最常见的估算错误。一次迭代里至少同时存在三份这么大的张量（policy 的 logits、policy 的 log_softmax、ref 的 logits），所以 `batch_size=8` 时光这一项就超过 1.2 GB。",
+    "ref": "trainer/train_dpo.py#L29"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "`dpo_loss` 里 `batch_size = ref_log_probs.shape[0]`（L40）。用默认参数 `--batch_size 4` 跑 `train_dpo.py`，这个局部变量 `batch_size` 的值是多少？`chosen_ref_log_probs` 的 shape 呢？",
+    "options": [
+      "`8` 和 `[4]`",
+      "`4` 和 `[2]`",
+      "`8` 和 `[4, 1023]`",
+      "`4` 和 `[4, 1023]`"
+    ],
+    "answer": [0],
+    "explain": "L40 读的是 `ref_log_probs.shape[0]`，而 `ref_log_probs` 在 L36 已经被**就地重新赋值**成 `[2B]` 的一维张量了——`2B = 2 × 4 = 8`。所以这个叫 `batch_size` 的局部变量其实是 `2B`，和命令行的 `--batch_size 4` 不是一回事（B、D 错）。`[:8 // 2]` 切出 `[4]`（C 错在它以为切分发生在 `[N, T]` 上，但 `T` 维在 L36 的 `sum(dim=1)` 里已经没了）。trace 里能直接看到这两个数。",
+    "ref": "trainer/train_dpo.py#L40-L41"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "policy 和 ref 都加载同一份 `full_sft` 权重，`beta=0.15`，而且这个 batch 的 `mask` 恰好全是 0（极端情况：一条 assistant 内容都没框到）。第一步 `dpo_loss` 的返回值是多少？",
+    "options": [
+      "`0.0`，因为所有序列级 log prob 都是 0",
+      "`0.6931`（= ln 2）",
+      "`0.15 × 0.6931 ≈ 0.1040`",
+      "`nan`，因为 mask 求和之后分母为 0"
+    ],
+    "answer": [1],
+    "explain": "mask 全 0 让 `(log_probs * mask).sum(dim=1)` 变成全 0 的 `[2B]`，于是 `pi_logratios = ref_logratios = 0`，margin `logits = 0`，loss = `-logsigmoid(0.15 × 0)` = `-log(0.5)` = ln 2 ≈ 0.6931（实验表格第 4 行实测 0.6931471825）。D 错在源码是 `sum` 不是 `mean`，压根没有除法，不会出现 `nan`；C 错在 beta 乘在 margin 上而不是乘在 loss 上。更一般地：**只要 policy 和 ref 是同一组权重，第一步 loss 必然是 0.6931，与 beta、mask、序列长度、数据内容全都无关**。",
+    "ref": "trainer/train_dpo.py#L36"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "承接上一题的场景：某人把 `torch.cat` 的顺序写反了（rejected 在上半边）。他跑起训练，看到第一步 loss 打印出 `0.6931`。他能据此判断配置正确吗？",
+    "options": [
+      "能：0.6931 是 DPO 唯一可能的正确起点，说明 chosen/rejected、mask、ref 权重全都对",
+      "不能：顺序写反时第一步 loss 会变成 `-0.6931`，他看到的 0.6931 说明其实没写反",
+      "不能：顺序写反时会在 `logsigmoid` 那一行报错，能跑起来说明另有问题",
+      "不能：policy == ref 时 margin 恒为 0，**无论 chosen/rejected 谁在上半边**，第一步都精确等于 ln 2；但梯度方向已经整个反了"
+    ],
+    "answer": [3],
+    "explain": "第一步 policy 和 ref 是同一份权重，`pi_logratios` 和 `ref_logratios` 逐元素相等，margin 恒为 0——交换上下半边只是同时给两者变号，差还是 0。所以 `0.6931` 这个 sanity check 恰恰照不到「顺序写反」这个角落。实测（3 对真实样本、beta=0.15）：policy==ref 时两种顺序都是 0.6931471825；一旦换成 policy=`pretrain`、ref=`full_sft`，正常顺序 loss=2.8460、交换顺序 loss=1.8534——两个数值都毫无异常，光看 loss 根本发现不了。这是最隐蔽的 DPO bug 之一。",
+    "ref": "trainer/train_dpo.py#L46-L48"
+  },
+  {
+    "id": "q11",
+    "type": "multi",
+    "question": "关于 `--beta`（`train_dpo.py` 默认 0.15），以下哪些说法正确？（多选）",
+    "options": [
+      "margin = 0 处的梯度大小 $|\\partial\\mathcal{L}/\\partial m| = \\beta/2$，所以 beta 直接就是梯度的尺度",
+      "policy == ref 时的 loss 值会随 beta 增大而增大",
+      "beta 可以理解为隐式 KL 约束的强度：越大，越不允许 policy 偏离 ref",
+      "隐式 reward $\\hat r = \\beta\\log\\frac{\\pi_\\theta}{\\pi_{ref}}$ 与 beta 成正比，所以 beta 翻倍，reward margin 也翻倍"
+    ],
+    "answer": [0, 2, 3],
+    "explain": "A 对：$\\partial\\mathcal{L}/\\partial m = -\\beta\\sigma(-\\beta m)$，在 $m=0$ 处等于 $-\\beta/2$。C、D 对：这正是 DPO 把 reward 重参数化成 $\\beta\\log(\\pi_\\theta/\\pi_{ref})$ 的含义，`beta * logits` 就是 reward margin。**B 错**：policy==ref 时 margin 恒为 0，loss = $-\\log\\sigma(0)$ = ln 2，和 beta 完全无关——实验里 beta=0.1/0.15/1.0 三条曲线在 margin=0 处都精确交于 0.693147，`ln2_sanity` 的表格里换成 beta=1.0 也仍是 0.6931471825。",
+    "ref": "trainer/train_dpo.py#L49"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`train_dpo.py` 对 ref_model 做了 `eval()` + `requires_grad_(False)`，调用处又套了 `with torch.no_grad():`。如果**只删掉 `with torch.no_grad():` 这一层**（另外两个保留），会发生什么？",
+    "options": [
+      "报错：`requires_grad_(False)` 之后的模块不能在 `no_grad` 之外前向",
+      "ref_model 的参数开始累积 `.grad`，policy 的梯度被污染",
+      "数值不变，但显存明显上涨——ref 的所有中间激活会被保留下来等 backward",
+      "数值和显存都不变：ref 的参数已经 `requires_grad=False`、`input_ids` 又是整型，整个前向根本不会建图"
+    ],
+    "answer": [3],
+    "explain": "autograd 只在**有输入需要梯度**时才建图、才保存中间激活。ref 的参数全部 `requires_grad=False`，`input_ids` 是 int64 不可微，所以输出的 `requires_grad` 就是 `False`、`grad_fn` 是 `None`——实验里故意不套 `no_grad` 前向了一次，表格前三行就是这个结论。B 还有第二重保险：`optimizer = AdamW(model.parameters())` 压根看不见 ref 的参数（表格第 5 行）。这四道保险里真正不可替代的是 `eval()`：它关掉 dropout，也让 MoE 的 aux_loss 走 `else` 分支恒为 0（model/model_minimind.py:171，实验最后两行实测 0.000000 vs 0.001079）。",
+    "ref": "trainer/train_dpo.py#L187-L188"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "迷你实验里 DPO 的 loss 在第 9 步就掉到 0.0001，第 11 步起一直显示 0.0000。下面哪个解读是对的？",
+    "options": [
+      "模型已经收敛到最优，可以停了——loss 为 0 意味着 chosen 的概率被顶到了 1",
+      "loss 为 0 说明梯度也为 0，后面十几步完全没有更新参数，是纯粹的空转",
+      "只说明这批数据的 chosen / rejected 被拉开了：$-\\log\\sigma(\\beta m)$ 在 $m$ 大了之后梯度 $\\propto\\sigma(-\\beta m)$ 指数衰减，而此时 chosen 的**绝对** log prob 可能正在下降",
+      "说明 beta 太小了，应该调大 beta 让 loss 重新有区分度"
+    ],
+    "answer": [2],
+    "explain": "loss 只看 margin $m = \\log\\pi_\\theta(y_w) - \\log\\pi_\\theta(y_l)$ 减掉 ref 那一项，它变小只说明**差**被拉开了，和 chosen 的绝对概率无关（A 错）。实验实测：loss 掉到 0 之后 chosen 的序列 log prob 从峰值 −74.45 一路回落到 −88.23，rejected 则跌到 −260.79——参数还在动（B 错），只是动的方向是「两个一起压低、rejected 压得更狠」。调大 beta 只会让 margin 更快饱和，不解决问题（D 错）。这就是 DPO 必须盯 chosen 绝对 log prob、配小 lr + 早停的原因。",
+    "ref": "trainer/train_dpo.py#L49"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`train_dpo.py` 的默认 `--learning_rate` 是 `4e-8`，比 SFT 常用的 `5e-5` 小三个数量级。最贴切的原因是什么？",
+    "options": [
+      "DPO 的梯度里有一项是无条件压低 rejected 序列上的**每一个** token，而这些 token（常用字、标点、换行）和 chosen 高度重合；lr 一大，模型就靠整体压低常用词来降 loss，输出崩掉而 loss 曲线反而更好看",
+      "因为 DPO 要跑两个模型，梯度被加了两遍，所以 lr 要除以 2 的若干次方来补偿",
+      "因为 `dpo_loss` 用的是 `sum` 而不是 `mean`，loss 的数值量级比交叉熵大三个数量级",
+      "因为 `logsigmoid` 的梯度上界是 1，比交叉熵的梯度大得多，必须用小 lr 压住"
+    ],
+    "answer": [0],
+    "explain": "梯度形式是「每个 mask=1 的 chosen token −β/(2n)、每个 rejected token +β/(2n)」（beta_grad 实验实测 ∓0.016667）。压低 rejected 里那些最普通的 token，等于同时压低模型在所有场景下生成它们的概率，这就是 DPO 的退化路径。B 错：ref 那一路在 `no_grad` 里，根本不贡献梯度。C 错：`sum` 影响的是序列 log prob 的量级，而 loss 是 `-logsigmoid(beta·margin)`，第一步恒为 0.6931，量级并不夸张。D 错：$|\\partial\\mathcal{L}/\\partial m| \\le \\beta = 0.15$，比 1 小得多。",
+    "ref": "trainer/train_dpo.py#L137"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "`train_dpo.py` 的默认 `--from_weight` 是 `full_sft`，而不是 `pretrain`。如果改成 `pretrain`（policy 和 ref 都从预训练权重出发），最可能出现的情况是？",
+    "options": [
+      "第一步 loss 不再是 0.6931，因为 pretrain 权重下 chosen 和 rejected 的 log prob 差很大",
+      "第一步 loss 仍然是 0.6931（policy 仍然等于 ref），但训练出来的模型不会说话——DPO 只调偏好，不负责教模型遵循 chat 模板",
+      "会在 `logits_to_log_probs` 报 shape 错误，因为 pretrain 权重的 vocab_size 不同",
+      "完全等价：DPO 的 loss 只看 policy 和 ref 的相对关系，起点是哪份权重无所谓"
+    ],
+    "answer": [1],
+    "explain": "ln 2 只要求 policy 和 ref 是**同一组**权重，和具体是哪一组无关（A 错，`ln2_sanity` 表格里换成别的权重只要两边一致仍是 0.6931）。两份权重的 config 完全一样，不会有 shape 问题（C 错）。真正的问题是 DPO 的数据量（`dataset/dpo.jsonl`）和目标都只够微调偏好：它从来不教模型 `<|im_start|>assistant` 之后该怎么组织回答。D 错在起点决定了 ref 这个「不许偏离太远」的锚点是什么——锚在一个不会聊天的模型上，结果自然也不会聊天。",
+    "ref": "trainer/train_dpo.py#L150"
+  },
+  {
+    "id": "q16",
+    "type": "multi",
+    "question": "`dpo_loss` 用 `(log_probs * mask).sum(dim=1)` 聚合序列 log prob（求和，不是按有效 token 数平均）。以下哪些说法正确？（多选）",
+    "options": [
+      "这和 DPO 原论文一致：论文里的 $\\log\\pi_\\theta(y\\mid x)$ 本来就是整条序列 token log prob 之和",
+      "policy == ref 时长度带来的偏置会严格抵消，所以第一步 loss 仍然精确等于 ln 2",
+      "每个 `mask=1` 的 token 拿到的梯度大小相同，因此越长的序列拿到的梯度总量越多",
+      "改成按有效长度平均后，policy == ref 时的 loss 会从 ln 2 变成 ln 2 除以平均长度"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "A 对：$\\pi_\\theta(y\\mid x)$ 是整条序列的联合概率，取 log 就是求和；TRL 的 `DPOTrainer` 默认也是求和。B 对：loss 只看 $\\log\\pi_\\theta - \\log\\pi_{ref}$ 的差，长度项完全抵消。C 对：beta_grad 实验实测 beta=0.1、3 对时每个有效 token 都是 ±0.016667 = $\\beta/(2n)$，8 个 token 的行梯度之和是 ∓0.1333，10 个 token 的是 ∓0.1667。**D 错**：长度归一化只改聚合方式，policy==ref 时 margin 依然是 0，loss 依然是 ln 2——length_bias 实验里 mean 版在整条 δ 扫描上恒为 0.6931。",
+    "ref": "trainer/train_dpo.py#L36-L37"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "用默认参数跑 `python train_dpo.py`（`--batch_size 4`、`--max_seq_len 1024`、非 MoE）。`train_epoch` 里的 `policy_log_probs` 和 `dpo_loss` 内部最终返回值的 shape 分别是什么？",
+    "options": [
+      "`[8, 1023]` 和 `[]`（标量）",
+      "`[4, 1024]` 和 `[2]`",
+      "`[8, 1024, 6400]` 和 `[4]`",
+      "`[4, 1023]` 和 `[]`（标量）"
+    ],
+    "answer": [0],
+    "explain": "`DPODataset` 把每条 padding 到 `max_length=1024`，再经 `[:-1]` / `[1:]` 得到长度 **1023**；`torch.cat([x_chosen, x_rejected], dim=0)` 把行数从 4 变成 **2×4 = 8**。于是 `logits` 是 `[8, 1023, 6400]`，`logits_to_log_probs` 压成 `[8, 1023]`；进 `dpo_loss` 后 `(·*mask).sum(dim=1)` → `[8]`，`[:4]` / `[4:]` → 两个 `[4]`，margin `[4]`，最后 `.mean()` → 0 维标量。C 混淆了 logits 和 per-token log prob，B/D 漏掉了 `cat` 的 2 倍。",
+    "ref": "trainer/train_dpo.py#L65"
+  },
+  {
+    "id": "q18",
+    "type": "multi",
+    "question": "把 `train_dpo.py` 和 Day 9 的 `train_full_sft.py` 对比，以下哪些是 DPO **真正新增**的东西？（多选）",
+    "options": [
+      "多维护一个冻结的 ref_model，每步多跑一次前向",
+      "同一个 `--batch_size` 下进模型的行数翻倍（`torch.cat` 把 chosen / rejected 拼在一起）",
+      "loss 从 `F.cross_entropy` 换成 `-logsigmoid(beta · margin)`，输入是两个模型的序列级 log prob",
+      "把余弦学习率调度、梯度累积、`clip_grad_norm_`、checkpoint 续训整套换成了 DPO 专用的实现"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "A、B、C 正是今天讲的三处改动。**D 错**：`get_lr` / `accumulation_steps` / `clip_grad_norm_` / `lm_checkpoint` / `SkipBatchSampler` 全部来自 `trainer/trainer_utils.py`，和 `train_pretrain.py`、`train_full_sft.py` 共用同一套实现，一个字都没改（trainer/train_dpo.py:20 的 import 和 L87-L94 的循环体）。这也是读 MiniMind 这类仓库的一个小技巧：先 diff 训练脚本，新增的部分往往只有几十行。",
+    "ref": "trainer/train_dpo.py#L83-L94"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "`beta=0.15`。某一对样本上，policy 的 chosen 序列 log prob 比 ref 高 2.0，rejected 序列 log prob 比 ref 低 3.0。这一对的 margin（源码 L48 那个 `logits`）和它贡献的 loss 分别是多少？",
+    "options": [
+      "margin = −1.0，loss ≈ 0.8283",
+      "margin = 5.0，loss ≈ 0.6931",
+      "margin = 5.0，loss ≈ 0.3869",
+      "margin = 0.75，loss ≈ 0.3869"
+    ],
+    "answer": [2],
+    "explain": "margin = `pi_logratios - ref_logratios` = $[\\log\\pi_\\theta(y_w)-\\log\\pi_{ref}(y_w)] - [\\log\\pi_\\theta(y_l)-\\log\\pi_{ref}(y_l)]$ = $2.0 - (-3.0) = 5.0$（A 把两项相减写成了相加）。loss = $-\\log\\sigma(0.15 \\times 5.0) = -\\log\\sigma(0.75) = 0.38687$。D 把 `beta × margin` 当成了 margin 本身——`beta` 只在 L49 乘进去，L48 的 margin 里没有 beta。顺带一提 `0.15 × 5.0 = 0.75` 正是这一对的 reward margin $\\hat r(y_w) - \\hat r(y_l)$。",
+    "ref": "trainer/train_dpo.py#L48-L49"
+  },
+  {
+    "id": "q20",
+    "type": "multi",
+    "question": "你接手一份 DPO 训练脚本，第一步 `Logger` 打印出来的 `loss` 不是 `0.6931`。以下哪些是可能的原因？（多选）",
+    "options": [
+      "ref_model 和 policy 加载了不同的权重文件（比如一个 `full_sft`、一个 `pretrain`）",
+      "开了 MoE（`--use_moe 1`）：打印的 `loss` 是 `dpo_loss_val + outputs.aux_loss`，而 policy 处于 `train()` 模式时 aux_loss 不为 0",
+      "`torch.cat([x_chosen, x_rejected])` 的顺序写反了",
+      "`mask` 的行序和 `y` 的行序对不上（只对 `y` 做了 `cat`，`mask` 用了别的顺序）"
+    ],
+    "answer": [0, 1],
+    "explain": "ln 2 成立的充要条件是 `pi_logratios` 逐元素等于 `ref_logratios`，而只要 policy 和 ref 是同一组权重、吃同一个 `x`，两份 per-token log prob 就逐元素相等——**之后不管用什么 mask、怎么切分，差都恒为 0**。所以 C、D 都仍然给出 0.6931（C 只是给 margin 整体变号，0 变号还是 0；D 虽然 mask 错了，但 policy 和 ref 用的是同一个错 mask，照样抵消）——这正是这类 bug 难查的原因。A 直接破坏了「同一组权重」。B 是另一条路：`loss = dpo_loss_val + outputs.aux_loss`（trainer/train_dpo.py:84），非 MoE 时 aux_loss 恒为 0，MoE + `train()` 模式下它是真实的负载均衡项（ref_frozen 实验实测 eval 0.000000 / train 0.001079），于是 `loss` 会比 `dpo_loss` 大一点点——日志里那两个数就是这么分开打的。",
+    "ref": "trainer/train_dpo.py#L46-L50"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "policy 和 ref 是同一份权重（margin 全为 0，loss = ln 2），`beta=0.1`，batch 里有 3 对样本、每条序列有 8 个 `mask=1` 的 token。对 `dpo_loss` 的入参 `policy_log_probs`（`[6, 13]`）求梯度，它长什么样？",
+    "options": [
+      "全是 0：margin = 0 正好是 $-\\log\\sigma$ 曲线最平的地方，梯度消失",
+      "只有每条序列最后一个 `mask=1` 的位置有梯度，前面的都被 `sum` 吃掉了",
+      "chosen 那 3 行里每个 `mask=1` 的位置都是 −0.016667，rejected 那 3 行都是 +0.016667，`mask=0` 的位置是 0",
+      "梯度大小正比于该位置自己的 log prob：模型越不确定的 token 拿到越大的梯度"
+    ],
+    "answer": [2],
+    "explain": "$\\partial\\mathcal{L}/\\partial m = -\\beta\\sigma(-\\beta m)$，在 $m=0$ 处是 $-\\beta/2$——σ 在 0 处斜率**最大**，所以这里恰恰是梯度最大的地方，不是最小（A 错）。再往回传：L50 的 `.mean()` 除以对数 $n=3$，L36 的 `sum` 把这份梯度**原样均分**给每一个 `mask=1` 的位置（不是只给最后一个，B 错；也和该位置的数值无关，D 错），于是每个有效 token 都是 $\\mp\\beta/(2n) = \\mp 0.1/6 = \\mp 0.016667$。实验实测 chosen 行 −0.016667、rejected 行 +0.016667、mask=0 处 0.000000，整行之和 −0.133333 = 8 × 0.016667。梯度下降朝反方向走，于是抬高 chosen、压低 rejected。",
+    "ref": "trainer/train_dpo.py#L49-L50"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "拿 `full_sft` 同时当 policy 和 ref，`beta=0.1`、`lr=2e-6`，在 8 对真实偏好样本上跑 16 步，每步之后用同一个固定探针 batch 测序列级 log prob。**chosen** 的那条曲线会怎么走？",
+    "options": [
+      "单调上升：loss 的目标就是抬高 chosen 的概率，16 步不够它掉头",
+      "先升后降：前几步明显上升，随后掉头一路向下",
+      "从第 1 步起就单调下降，和 rejected 同向，只是降得慢一些",
+      "几乎不动（波动 < 1）：loss 的下降全部由 rejected 的暴跌贡献"
+    ],
+    "answer": [1],
+    "explain": "实测 chosen 从 −96.33 涨到第 7 步的 **−74.45**（峰值），之后掉头向下，第 16 步回到 −88.23；rejected 则一路从 −83.00 跌到 −260.79。原因是 loss 只关心两者的**差**：「抬高 chosen」和「两个一起压低、rejected 压更狠」对 loss 完全等价，而后者在参数空间里往往更便宜，所以模型走着走着就换了路线。这也是为什么 DPO 训练必须盯 chosen 的**绝对** log prob，而不是只盯 loss 曲线——loss 到第 9 步就已经是 0.0001 量级了，可 chosen 还在继续跌。把 `LR` 调到 `1e-5`（实验第二条任务）会让掉头来得更早。",
+    "ref": "trainer/train_dpo.py#L83"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "policy 相对 ref 只做了一件事：把**每一个** token 的 log prob 都统一压低 δ = 0.3（完全不含任何偏好信息）。取 4 对真实样本，有效长度分别是 chosen 26/77/95/33、rejected 81/26/65/100，`beta=0.1`。用仓库的 `dpo_loss`（求和聚合）算，这 4 对的 loss 各是多少？",
+    "options": [
+      "全是 0.6931：δ 在 policy 和 ref 的差里被完全抵消了",
+      "全部下降到 0.6931 以下：整体压低 log prob 总是让 loss 变好",
+      "全部上升到 0.6931 以上：模型变得更不自信，loss 必然变差",
+      "有的降有的升（0.1757 / 1.7260 / 1.2412 / 0.1257），取决于这一对里 rejected 是不是比 chosen 长"
+    ],
+    "answer": [3],
+    "explain": "求和聚合下，序列 log prob 减少的量是 $\\delta \\times$ 有效长度，于是 margin = $\\delta(\\text{len}_r - \\text{len}_c)$——完全由长度差决定。第 0 对（26 vs 81）白赚 +16.5 的 margin，loss 从 0.6931 掉到 **0.1757**；第 3 对（33 vs 100）白赚 +20.1，掉到 **0.1257**；而 chosen 更长的第 1、2 对方向相反，升到 1.7260 / 1.2412。A 是「差会抵消」的直觉，但只有在两条序列**等长**时才成立；长度归一化版本才是恒等于 0.6931 的那一个（实验里 mean 版四对全是 0.6931）。这就是 `sum` 聚合的长度偏置：模型什么偏好都没学，只是整体变得不那么自信，就能「赚」到 loss。",
+    "ref": "trainer/train_dpo.py#L36-L37"
+  }
+]

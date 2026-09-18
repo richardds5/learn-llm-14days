@@ -1,0 +1,354 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`PretrainDataset.__getitem__` 里 `tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True)`——为什么是 `max_length - 2`？",
+    "options": [
+      "要给紧接着手动拼上去的 BOS 和 EOS 各留一格，拼完刚好等于 `max_length`",
+      "因为 `tokenizer()` 会自动在两端各插一个特殊 token，要先把它们减掉",
+      "给右 padding 至少预留 2 个位置，保证每条样本末尾都有 padding",
+      "因为 `pad_token_id=0`、`bos_token_id=1` 占掉了词表的前两个 id"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "下一行就是 `tokens = [bos_token_id] + tokens + [eos_token_id]`（`dataset/lm_dataset.py:50`）：正文最多占 `max_length-2` 格，加上手动拼的头尾正好填满 `max_length`。选项 B 正好反了——这一行显式写了 `add_special_tokens=False`，就是为了把「自动插」关掉、改成手动拼；两者只能留一个。选项 C 也不对：原文够长时（实验表格 `idx=1` 那一行，35 个 token、`max_length=24`）padding 数是 0。",
+    "ref": "dataset/lm_dataset.py#L49-L51"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "实验里第 1 条文本原文有 35 个 token，`max_length=24`，显然放不下。截断之后这条 `input_ids` 的**最后一个非 padding token** 是什么？",
+    "options": [
+      "是正文的第 22 个 token——超长样本会丢掉结束符",
+      "仍然是 `<|im_end|>`：`truncation` 只作用在 `tokenizer(...)` 这一步，BOS/EOS 是之后才手动拼上去的",
+      "是 `<|endoftext|>`，因为长度已经到 24，必须用 padding 收尾",
+      "会抛 IndexError，因为 22 + 2 已经超过了 `max_length`"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "顺序是「先截断正文 → 再拼 BOS/EOS → 再 padding」。`truncation=True, max_length=self.max_length-2` 把正文砍到 22 个 token，然后 `[bos] + 22 个 + [eos]` = 24，正好填满，padding 数为 0。所以**任何一条 pretrain 样本都以 `<|im_start|>` 开头、`<|im_end|>` 结尾**。实验表格里 `idx=1` 那一行的「末尾 padding 数 = 0、正文后那个特殊 token = `<|im_end|>`」就是这个结论。如果写成「先拼好再整体截断」，结束符就会被切掉——这是两种写法的实质差别。",
+    "ref": "dataset/lm_dataset.py#L49-L51"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "一条 pretrain 文本的**正文中间**写了一个字面的 `<|endoftext|>`（真实语料里常用它分隔文档；tokenizer 会把它编成 id 0，也正是 `pad_token_id`）。跑完 `labels[input_ids == self.tokenizer.pad_token_id] = -100` 这一行，这个位置的 `labels` 会是什么？",
+    "options": [
+      "还是这个 token 本身——这一行只作用在右侧那段补齐出来的 padding 上",
+      "`-100`：这一行是按 token 的**值**逐元素比较的，正文中间也会被挖出一个不参与 loss 的空洞",
+      "程序会报错：正文里不允许出现特殊 token",
+      "整条样本的 `labels` 都会被设成 `-100`"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`input_ids == self.tokenizer.pad_token_id` 是一次逐元素的**值**比较，它不知道「哪一段是我们补上去的」这个语义。实验彩带里下标 6 那一格（来自正文的 `<|endoftext|>`）被画成了 0，20 格里只有 12 格参与 loss——句子中间被挖了个洞。绝大多数时候按值和按位置是等价的（正文里很少出现这个 token），但不是恒等价；真正的预训练语料里用 `<|endoftext|>` 当文档分隔符非常常见，这就是一个会被静默吞掉的边界情况。",
+    "ref": "dataset/lm_dataset.py#L53-L54"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`PretrainDataset` 返回的 `labels` 和 `input_ids` 是什么对齐关系？",
+    "options": [
+      "`labels[i] == input_ids[i+1]`，Dataset 已经替模型错开了一位",
+      "`labels` 比 `input_ids` 短一位，因为最后一个位置没有预测目标",
+      "`labels[i] == input_ids[i]`（除了被置 `-100` 的位置）——错位交给 `MiniMindForCausalLM.forward` 里的 `shift_logits` / `shift_labels`",
+      "`labels` 是 `[max_length, vocab_size]` 的 one-hot"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "源码就是 `labels = input_ids.clone()`，逐位相等；实验里 `input_ids[:4]` 和 `labels[:4]` 打印出来完全一样。错位发生在模型内部（Day 5：`shift_logits = logits[..., :-1, :]`、`shift_labels = labels[..., 1:]`），这正是 `trainer/train_pretrain.py:36` 能直接写 `res = model(input_ids, labels=labels)` 的前提。注意 `DPODataset` 是反过来的——它在 Dataset 层就把 `x`/`y` 错开了，因为 `train_dpo.py` 不走模型内置 loss。",
+    "ref": "dataset/lm_dataset.py#L53-L55"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "`create_chat_prompt` 调用 `apply_chat_template(messages, tokenize=False, add_generation_prompt=False, tools=tools)`。其中 `add_generation_prompt=False` 关掉的是什么？",
+    "options": [
+      "不在渲染结果的结尾追加 `<|im_start|>assistant\\n`（以及后面那个 `<think>` 块）",
+      "不在最前面插入 system 消息",
+      "不给 assistant 回复渲染 `<think>...</think>` 块",
+      "不返回 `attention_mask`，只返回文本"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "看 `model/tokenizer_config.json` 里 chat_template 的最后一段：`{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}` 再根据 `open_thinking` 补 `<think>\\n` 或 `<think>\\n\\n</think>\\n\\n`。SFT 训练要的是**完整**对话，最后一条 assistant 回复已经在数据里了，不需要再留一个开头；只有推理（Day 7 的 `generate`）和 RLAIF（本课 `RLAIFDataset`，它传的正是 `add_generation_prompt=True`）才需要。选项 C 说的是模板里 assistant 分支无条件渲染的东西，和这个参数无关。",
+    "ref": "dataset/lm_dataset.py#L81-L86"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`create_chat_prompt` 最后传给 `apply_chat_template` 的 `tools` 参数是从哪里来的？",
+    "options": [
+      "从 `SFTDataset.__init__` 的参数传进来，整份数据共用一套工具",
+      "从 `tokenizer_config.json` 的 chat_template 里读出来",
+      "从每条 assistant 消息的 `tool_calls` 反推出来",
+      "遍历 conversations，取 `role == \"system\"` 且带 `tools` 字段的那条消息，把它的 JSON 字符串 `json.loads` 成 list"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "`if message.get(\"role\") == \"system\" and message.get(\"tools\"): tools = json.loads(message[\"tools\"]) ...`（`dataset/lm_dataset.py:76-77`）。两个细节：① 工具 schema 是**逐样本**的，写在这条样本自己的 system 消息里；② 它并不跟着那条 message 一起渲染，而是被抽出来当独立参数传出去，模板里 `{%- if tools %}` 那个分支会把它渲染成一整段 `# Tools ... <tools>...</tools>` 的系统提示。实验表格显示：如果忘了 `json.loads`、直接把字符串传给 `tools=`，`apply_chat_template` 会抛 `ValueError: Tools should either be a JSON schema, ...`。",
+    "ref": "dataset/lm_dataset.py#L74-L80"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`post_processing_chat(prompt_content, empty_think_ratio=0.2)` 的条件是 `if '<think>\\n\\n</think>\\n\\n' in prompt_content and random.random() > empty_think_ratio: 删掉`。用默认参数时，空 think 块被**保留**的概率是多少？",
+    "options": [
+      "约 20%",
+      "约 80%",
+      "约 50%",
+      "0%，只要出现就一定被删"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "注意是 `random.random() > 0.2`——这个条件有 80% 的概率成立，也就是 **80% 的概率执行删除**，只有 20% 的概率保留。参数名 `empty_think_ratio` 指的是「保留空 think 的比例」，配的是 `>` 而不是 `<`（对比 `pre_processing_chat` 里的 `if random.random() < add_system_ratio`，那里才是 `<`）。实验跑 200 次实测保留 35 次 ≈ 18%，在 20% 附近抖动。教学含义：训练数据里 80% 的 assistant 回复是「直接开口」的格式，20% 带一个空想块。",
+    "ref": "dataset/lm_dataset.py#L31-L35"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "`self.bos_id` 是 `<|im_start|>assistant\\n` 编码出来的 5 个 token。`generate_labels` 为什么不能图省事、只匹配它的第 0 个 id？",
+    "options": [
+      "因为 `<|im_start|>user\\n` / `<|im_start|>system\\n` / `<|im_start|>tool\\n` 的第 0 个 id 也都是 1，只看它分不出是谁在说话",
+      "因为 `<|im_start|>` 不在词表里，单独编码会变成 unk",
+      "因为 `bos_id` 的第 0 个 id 会随 `max_length` 变化",
+      "因为 tokenizer 每次编码同一段文本的结果都不一样"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "实验表格里四种角色并排列着：`<|im_start|>assistant\\n` = `[1, 1388, 570, 811, 234]`，`user` = `[1, 832, 311, 234]`，`system` = `[1, 118, 4849, 234]`，`tool` = `[1, 2263, 500, 234]`——第 0 个 id 全是 1（`<|im_start|>`），角色信息藏在后面那几个**普通** token 里（`ass`/`ist`/`ant`）。所以源码必须写成整段切片比较 `input_ids[i:i + len(self.bos_id)] == self.bos_id`。顺带：`len(self.bos_id) = 5` 这个数马上会被 `start = i + len(self.bos_id)` 用来跳过模板脚手架。",
+    "ref": "dataset/lm_dataset.py#L65-L66"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "一条 SFT 样本里有 3 轮 assistant 回复，`max_length` 足够大、一轮都没被截断。`generate_labels` 会标出几段 loss？",
+    "options": [
+      "只有最后一轮——前面两轮算上下文，全部被 mask 成 -100",
+      "只有第一轮，`while` 循环标完第一段就退出了",
+      "3 段：外层 `while` 会一路扫到底，每碰到一次 `bos_id` 就标一段，标完跳到段尾接着扫",
+      "取决于 `add_system_ratio`：注入了 system 就只标最后一轮"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "外层循环是 `while i < len(input_ids)`，标完一段之后 `i = end + len(self.eos_id)` 跳到这段结束的位置**继续**扫，而不是 return。实验彩带里三段亮区清清楚楚：`[15,23]`、`[40,48]`、`[62,72]`，96 格里 29 格参与 loss。「只学最后一轮」是对 SFT 最常见的误解之一——那种做法要另写代码（只在最后一个 `bos_id` 处标注），MiniMind 没有这么做。",
+    "ref": "dataset/lm_dataset.py#L88-L104"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "实验彩带里每一段亮区的**边界**在哪？（对照第一段解码出来的 `'<think>\\n\\n</think>\\n\\n2<|im_end|>\\n'`）",
+    "options": [
+      "从 `<|im_start|>` 那一格开始亮，到回复正文的最后一个字为止",
+      "从 `<|im_start|>assistant\\n` 之后的第一个 token（这里是 `<think>`）开始，一直亮到 `<|im_end|>` 后面那个 `\\n`",
+      "只有回复正文亮，`<think>` 块和收尾的 `<|im_end|>` 都是 -100",
+      "整条 `input_ids` 都亮，只有右侧 padding 是 -100"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "左边界 `start = i + len(self.bos_id)` **跳过**了 `<|im_start|>assistant\\n` 这 5 个模板脚手架 token；右边界是 `range(start, end + len(self.eos_id))`，把收尾的 `<|im_end|>\\n` 两个 token 也包了进来——模型必须学会什么时候停下来，否则永远不会主动结束生成。`<think>\\n\\n</think>\\n\\n` 落在 `start` 之后，所以（在没被 `post_processing_chat` 删掉时）它也是计入 loss 的。",
+    "ref": "dataset/lm_dataset.py#L92-L100"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "`max_length` 的截断口落在某一轮 assistant 回复中间，这一段只进来了 2 个 token（`<think>` 和 `\\n`），后面配对的 `<|im_end|>\\n` 根本没进窗口。`generate_labels` 会怎么处理这 2 个 token？",
+    "options": [
+      "内层 `while` 找不到 `eos_id`，`end` 越界抛 `IndexError`",
+      "外层 `while` 的 `i` 永远前进不了，程序死循环",
+      "整段保持 `-100`——没匹配到配对的 `eos_id` 就不算数",
+      "这 2 个 token 照样被标进 loss，`for` 的上界被 `min(end + len(eos_id), max_length)` 钳在窗口边界上"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "内层 `while end < len(input_ids)` 是**条件失败**退出的（不是 `break`），`end` 停在 `len(input_ids)`，不会越界读到不存在的下标（python 切片越界只会返回短的那截，不报错）。接着 `for j in range(start, min(end + len(self.eos_id), self.max_length))` 用 `min` 把上界钳住，`[start, max_length)` 之间已经出现的 token 照标不误。`i = end + len(...) if end < len(input_ids) else len(input_ids)` 则保证外层循环一定能结束。实验里 `max_length=64` 那三行的最后一段就是 `[62,63]`、2 个 token、解码是 `'<think>\\n'`。实际后果：长 system / 工具 schema 会悄无声息地挤掉靠后轮次的训练信号，不报任何错。",
+    "ref": "dataset/lm_dataset.py#L95-L101"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "同一条 3 轮样本，把 `max_length` 改成 48 再跑一次：第 2 段解码出来是 `'<think>\\n\\n</think>\\n\\n5<|im_end|>'`，比 `max_length=96` 时少了结尾那个 `\\n`。为什么？",
+    "options": [
+      "因为 `\\n` 在结尾会被 tokenizer 自动吃掉",
+      "因为右 padding 把它覆盖了",
+      "因为 `labels` 本来就要比 `input_ids` 短一位",
+      "因为 `eos_id` 是 `[<|im_end|>, \\n]` 两个 token，那个 `\\n` 落在下标 48 上、正好越过 `max_length`，被 `min(end + len(eos_id), self.max_length)` 砍掉了"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "`max_length=96` 时这一段是 `[40,48]`（9 个 token，`\\n` 在下标 48）；改成 48 之后窗口只到下标 47，`min(end + 2, 48)` 把 `for` 的上界钳在 48，于是只标到 `[40,47]`（8 个 token），`<|im_end|>` 进来了、它后面的 `\\n` 没进来。这也从侧面说明 `min(...)` 那一层保护在**每一段**上都可能生效，不只是最后一段完全没找到 `eos_id` 的情况。",
+    "ref": "dataset/lm_dataset.py#L99"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`DPODataset.__getitem__` 里 `mask_chosen = torch.tensor(chosen_loss_mask[1:])`——为什么是 `[1:]` 而不是 `[:-1]`？",
+    "options": [
+      "因为 mask 要和 `y = ids[1:]` 对齐：`mask[i]` 回答的是「预测 `y[i]` 这一格算不算 loss」",
+      "因为 mask 的第 0 位恒为 0，删掉它无所谓，写成 `[:-1]` 结果一样",
+      "因为 mask 要和 `x = ids[:-1]` 对齐，`[1:]` 是笔误",
+      "因为 `generate_loss_mask` 返回的长度比 `input_ids` 多一位"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`train_dpo.py` 里 loss 的写法是 `(logits_to_log_probs(logits, y) * mask).sum(dim=1)`——`log_probs` 是逐位置「预测出 `y[i]` 的对数概率」，所以乘上去的 mask 必须和 `y` 同步。`y = ids[1:]` 右移了一位，mask 也就得 `[1:]`。选项 B 不成立：原始 `loss_mask` 的第 0 位确实是 0，但 `[:-1]` 会把**最后**一位丢掉、其余整体左移，和 `y` 差一格，等于把每个位置的监督信号错配到前一个 token 上。",
+    "ref": "dataset/lm_dataset.py#L160-L165"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`DPODataset(..., max_length=128)`，取一条样本，`item['x_chosen'].shape` 是多少？",
+    "options": [
+      "`(128,)`",
+      "`(127,)`",
+      "`(129,)`",
+      "`(128, 6400)`"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`tokenizer(..., truncation=True, max_length=128, padding='max_length')` 先把 `chosen_input_ids` 铺成正好 128，然后 `x = ids[:-1]` / `y = ids[1:]` 各砍掉一位，于是 `x`/`y`/`mask` 三者都是 `(127,)`。实验第一行打印的就是这个。这是「Dataset 层做 shift」留下的一个很容易踩的坑：配 `max_seq_len` 时要记得模型实际看到的序列比它短 1。",
+    "ref": "dataset/lm_dataset.py#L148-L165"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`RLAIFDataset.create_chat_prompt` 渲染的是 `conversations[:-1]`，而且传 `add_generation_prompt=True`。为什么要这么组合？",
+    "options": [
+      "RLAIF 的回答要靠当前策略模型在训练时现场采样，数据里那条 assistant 内容没用；prompt 只需要停在「轮到 assistant 说话」的位置，把话筒交出去",
+      "因为最后一条 assistant 回复通常太长，放不进 `max_length`",
+      "`[:-1]` 是为了去掉开头那条 system 消息",
+      "为了让渲染结果里不出现 `<|im_end|>`，方便后面拼接"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`rlaif.jsonl` 里最后那条 assistant 消息的 `content` 本来就是空的或占位符（实验最后一行把它打印了出来）——留着只会让模型抄答案。`conversations[:-1]` 把它扔掉，`add_generation_prompt=True` 在结尾补上 `<|im_start|>assistant\\n`（和 SFT 的 `False` 恰好相反），再由 `open_thinking` 决定后面接半开的 `<think>\\n` 还是闭合的空 `<think>\\n\\n</think>\\n\\n`。`__getitem__` 返回 `{'prompt': <str>, 'answer': \"\"}`，两个字符串，没有 tokenize、没有 labels。",
+    "ref": "dataset/lm_dataset.py#L208-L224"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "`AgentRLDataset.__getitem__` 返回的是什么？",
+    "options": [
+      "`(input_ids, labels)` 两个定长 tensor，和 SFT 一样",
+      "`{'prompt': str, 'answer': str}`，和 RLAIF 一样",
+      "`{'messages': list[dict], 'tools': list|None, 'gt': ...}` 三个原生 python 对象，连 `apply_chat_template` 都没调用",
+      "一段渲染好的 prompt 字符串，外加 tokenize 之后的 `input_ids`"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`parse_conversations` 只做两件事：把 system 消息里的 `tools` 字符串 `json.loads` 出来、丢掉最后一条 assistant 消息（`messages[:-1]`），然后原样返回。连模板都不渲染，是因为 agentic rollout 是**多轮**的——模型吐一个 `<tool_call>`，训练脚本真的去执行工具，把结果作为新的 `tool` 消息追加进 `messages` 再渲染一次，循环若干轮。模板必须在 rollout 循环里边生成边做。`gt` 是这个 Dataset 独有的字段：最终校验目标（数学题的答案等），训练时用来算 reward。",
+    "ref": "dataset/lm_dataset.py#L239-L252"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "不传 `collate_fn`，直接 `next(iter(DataLoader(agent_rl_dataset, batch_size=2)))` 会发生什么？",
+    "options": [
+      "正常工作：都是 python 对象，默认 collate 会原样透传成一个 list",
+      "报一个明确的「两条样本长度不一致」的错误",
+      "报 `KeyError: 'location'`——默认 collate 递归地按位置把两条样本的嵌套 dict 拼在一起，两条样本的工具函数不同，某个参数名在另一条里根本不存在",
+      "自动把两条样本的 `messages` padding 到相同轮数"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "PyTorch 的 `default_collate` 对 `dict`/`list` 是**递归**处理的：先按 key 分组，再按位置把每条样本的 `tools[0]`、`tools[1]` 配对往里拼。实验用的 `agent_rl_math.jsonl` 前两条样本，第 0 条的工具是 `calculate_math` + `get_current_weather`（参数里有 `location`），第 1 条是 `calculate_math` + `translate_text`（参数里是 `text` / `target_language`），递归到那一层时 `location` 这个 key 在第二条里不存在，于是抛 `KeyError: 'location'`——报错信息完全不提「批内样本结构不一致」这个真正原因，非常难查。`trainer/train_agent.py:462` 里的自定义 `collate_fn` 干脆什么都不拼，三个字段各收集成 list。",
+    "ref": "dataset/lm_dataset.py#L249-L252"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "`lora_identity.jsonl` 共 91 条，渲染后长度中位数 60 个 token、最长 114。直接套用 `trainer/train_full_sft.py` 的默认值 `--max_seq_len 768`，平均 padding 占比大约是多少？",
+    "options": [
+      "约 10%",
+      "约 54%",
+      "约 92%",
+      "0%——`max_length` 足够大时不会产生 padding"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "实验表格实测：`max_length=64` → 截断 25.3%、padding 10.4%；`128` → 截断 0%、padding 53.7%；`768` → 截断 0%、padding **92.3%**。也就是说十分之九的 attention 矩阵和矩阵乘法都在算 `<|endoftext|>`。padding 位置 `labels=-100` 确实不产生 loss，但显存和 FLOPs 是按 `max_length` 实打实分配的。真实脚本敢用 768，是因为它面向的是 `sft_t2t.jsonl` 那种长度分布完全不同的主线数据——`max_seq_len` 必须按**你自己的数据**重新量。",
+    "ref": "dataset/lm_dataset.py#L111-L112"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "关于「shift 在哪一层做」，下面哪句话是对的？",
+    "options": [
+      "五个 Dataset 都在 `__getitem__` 里把 labels 右移了一位，模型内部不再 shift",
+      "只有 `PretrainDataset` 不 shift，其余四个都在 Dataset 层做",
+      "shift 统一由 `DataLoader` 的 `collate_fn` 完成",
+      "`PretrainDataset`/`SFTDataset` 返回逐位对齐的 `(input_ids, labels)`，shift 在 `MiniMindForCausalLM.forward` 里做；`DPODataset` 在 Dataset 层就把 `x`/`y`/`mask` 错开，因为 `train_dpo.py` 只 `model(x)` 拿 logits、自己 gather 算 loss"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "判断依据是「谁负责算 loss」。`train_pretrain.py:36` / `train_full_sft.py:36` 写的是 `model(input_ids, labels=labels)`——labels 进了模型，模型内部 `shift_logits = logits[..., :-1, :]` / `shift_labels = labels[..., 1:]` 完成错位（Day 5）。`train_dpo.py` 写的是 `outputs = model(x)`（不传 labels，内置 loss 路径根本没被触发），再 `logits_to_log_probs(logits, y)` 手动 `gather`，所以错位必须在 `__getitem__` 里提前做完。RLAIF/AgentRL 连 tensor 都不产出，谈不上 shift。",
+    "ref": "dataset/lm_dataset.py#L160-L165"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "五个 Dataset 的 `__getitem__` 里，哪一组关于「要不要 tokenize」的描述是准确的？",
+    "options": [
+      "五个都会 tokenize，只是 labels 的打法不同",
+      "只有 `SFTDataset` 会 tokenize，其余四个都只准备文本",
+      "`Pretrain`/`SFT`/`DPO` 三个 tokenize 并返回定长 tensor；`RLAIF` 只返回渲染好的字符串；`AgentRL` 连 `apply_chat_template` 都不调用",
+      "`RLAIF` 也 tokenize，只是不打 labels；只有 `AgentRL` 返回原生对象"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "分界线是「回答从哪来」。Pretrain/SFT/DPO 的目标序列在数据里就是现成的，所以可以离线 tokenize 成定长张量（`[max_length]` 或 DPO 的 `[max_length-1]`）。RLAIF/AgentRL 服务于在线 RL（Day 12~14），回答要用当前策略模型现场采样，Dataset 只能把 prompt 准备到「轮到 assistant 说话」为止——RLAIF 返回渲染好的字符串，AgentRL 因为要在 rollout 里多轮追加 tool 消息，连渲染都往后推，直接返回 `messages`/`tools`/`gt`。",
+    "ref": "dataset/lm_dataset.py#L195-L252"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "通读 `dataset/lm_dataset.py` 会发现几处「定义了但本文件里从未被使用」的属性。下面哪一处属于这种死代码？",
+    "options": [
+      "`SFTDataset.bos_id`（L65）",
+      "`DPODataset.eos_id`（L129）",
+      "`RLAIFDataset.bos_id` / `RLAIFDataset.eos_id`（L202-L203）",
+      "`PretrainDataset.max_length`（L41）"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`SFTDataset.bos_id`/`eos_id` 被 `generate_labels` 用（L92-L101），`DPODataset` 的被 `generate_loss_mask` 用（L180-L189），`PretrainDataset.max_length` 被 L49/L51 用。只有 `RLAIFDataset` 的这两行是孤儿——它的 `create_chat_prompt`/`__getitem__` 完全没引用过，而且写法还和另外两个不一样（少了结尾的 `\\n`：`f'{tokenizer.bos_token}assistant'`、`f'{tokenizer.eos_token}'`）。原因也很清楚：RLAIF 阶段还不存在 assistant 回复，没有 loss mask 可切，这两个属性大概率是复制 SFTDataset 时留下的。同一类的还有 `DPODataset.padding`（L127）和 `RLAIFDataset`/`AgentRLDataset` 的 `self.max_length`。",
+    "ref": "dataset/lm_dataset.py#L202-L203"
+  },
+  {
+    "id": "q20",
+    "type": "single",
+    "question": "一条 tool-use SFT 样本，光是 system 里的工具 schema 渲染出来就要 200 多个 token，后面还有 3 轮 assistant 回复。`max_length` 定得偏小时，最先被牺牲掉的是什么？",
+    "options": [
+      "排在后面的那几轮 assistant 回复——工具 schema 在序列最前面，一个 token 都不会掉，截断永远从尾部开始",
+      "system 里的工具 schema，因为它排在最前面，最先被截掉",
+      "中间的 user 消息，模板会优先保留首尾",
+      "只有右侧 padding 会少，训练信号不受影响"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "截断这一步是 `input_ids = self.tokenizer(prompt).input_ids[:self.max_length]`——一个普通的**从头开始**的切片，保留前 `max_length` 个 token、砍掉尾巴。工具 schema 被模板渲染在最前面，所以它永远完整保留，被砍的是排在后面的对话轮次。再结合 `generate_labels` 的行为（截断口落在回复中间时，已出现的部分照样计入 loss、其后的轮次一段 span 都找不到），结果就是：**长 system / 工具 schema 会静默地吃掉靠后轮次的训练信号**，既不报错也没有警告。选项 D 只在 `max_length` 仍大于真实长度时成立。",
+    "ref": "dataset/lm_dataset.py#L111-L112"
+  }
+]

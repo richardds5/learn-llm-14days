@@ -1,0 +1,370 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`MOEFeedForward.forward` 一上来就把 `[B,T,C]` 拉平成 `[B*T,C]`。最主要的原因是？",
+    "options": [
+      "`nn.Linear` 只接受二维输入，三维会报错",
+      "`F.softmax` 只能在二维 tensor 上沿最后一维计算",
+      "路由是 token 级决策，拉平后每一行就是一个独立 token，后面的 `topk` / 布尔 `mask` / `nonzero()` / `index_add_` 全变成第 0 维上的一维索引",
+      "`view` 能把非连续张量变成连续的，顺便省一份显存"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`nn.Linear` 只作用在最后一维、`F.softmax(dim=-1)` 同理，两者都能直接吃 `[B,T,C]`，所以 A/B 是常见误解。真正被简化的是分发那一段：`x_flat[token_idx]` 在二维上是一句话，在 `[B,T,C]` 上得先把一维下标拆回 `(b, t)` 两个坐标。D 也不对——`view` 恰恰要求输入连续（不连续得用 `reshape`），而且这里是零拷贝，不省显存。",
+    "ref": "model/model_minimind.py#L157-L158"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "`self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)`。默认配置（C=768, E=4, L=8）下，`gate.weight` 的 shape 是什么？整个模型的 router 一共多少参数？",
+    "options": [
+      "`[4, 768]`，8 层共 24,576 个参数",
+      "`[768, 4]`，8 层共 24,576 个参数",
+      "`[4, 768]`，整个模型只有 3,072 个参数（router 是全模型共享的）",
+      "`[4, 768]` 加上一个 `[4]` 的 bias，8 层共 24,608 个参数"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`nn.Linear(in, out).weight` 的形状是 `[out_features, in_features]`，所以是 `[E, C] = [4, 768]`，每层 3,072 个参数。router 不是共享的——每个 `MiniMindBlock` 有自己的 `mlp.gate`，8 层就是 `3072 × 8 = 24,576`，占 198M 总参数的 0.012%。`bias=False` 所以没有偏置项（实验里 `gate.bias` 打印出来是 `None`）。",
+    "ref": "model/model_minimind.py#L152"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`topk_weight, topk_idx = torch.topk(scores, k=1, dim=-1, sorted=False)`，`scores` 是 `[B*T=21, E=4]`。两个返回值的 shape 和 dtype 是？",
+    "options": [
+      "两个都是 `[21]`，dtype 都是 float32",
+      "`topk_weight` 是 `[21, 1]` float32，`topk_idx` 是 `[21]` int64——k=1 时尾巴那一维会被自动压掉",
+      "`topk_weight` 是 `[21, 1]` float32，`topk_idx` 是 `[21, 1]` int64",
+      "两个都是 `[21, 4]`，因为 `dim=-1` 上一共有 4 个 expert"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`torch.topk` 保留被取的那一维，只是把长度换成 `k`，**不会**因为 `k=1` 就压掉（要压得自己 `squeeze`）。所以两者都是 `[B*T, k] = [21, 1]`；`topk_weight` 是从 `scores` 里取的概率值（float32），`topk_idx` 是列号即 expert 编号（int64）。正因为尾巴没被压掉，L166 才需要写 `mask.any(dim=-1)` 把 `[21,1]` 的布尔收成 `[21]`。",
+    "ref": "model/model_minimind.py#L160"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "`num_experts_per_tok=1`、`norm_topk_prob=True` 时，`topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)` 的结果是？",
+    "options": [
+      "还是原来的概率值（0.53、0.317……），因为 1e-20 太小、除以自己等于没除",
+      "**精确的** `1.0`：float32 下 `w + 1e-20` 被舍入成 `w` 本身，与这个 token 的路由概率无关",
+      "约等于 1，但不同 token 之间还留着 1e-20 量级的差异，autograd 能利用这点差异学习",
+      "抛 `RuntimeError`：长度为 1 的维度不能做 `sum(dim=-1)`"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "k=1 时 `sum(dim=-1)` 就是 `w` 自己，表达式变成 `w/(w+1e-20)`。float32 只有约 7 位十进制有效数字，`w` 在 0.2~0.9 量级时 `w+1e-20` 舍入后就等于 `w`，商是位模式完全相同的 `1.0`——实验里「与 1 的偏差」那一列打印的是 `0.000e+00`，不是一个很小的数。`sum(dim=-1, keepdim=True)` 对长度为 1 的维度完全合法，不会报错。",
+    "ref": "model/model_minimind.py#L161"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "把源码里的 `1e-20` 改成 `1e-2`（其余不变，k 仍是 1），实验表格里 k=1 那两行的「归一化后」会变成？",
+    "options": [
+      "还是精确的 1.0，因为分子分母是同一个数",
+      "变成 0，分母被 1e-2 支配了",
+      "约 0.97（`w/(w+0.01)`），而且不同 token 的值各不相同——这个常数不再小到会被舍入掉",
+      "抛异常，因为归一化后的权重之和不再等于 1"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "把常数从 1e-20 换到 1e-2，它就不再小于 float32 在 `w` 附近的分辨率了。实测第 0 个 token 的权重 `w=0.5304`，`0.5304/(0.5304+0.01) = 0.9815`，与 1 的偏差 1.85e-2；第 1 个 token `w=0.3175` 时是 `0.3175/(0.3175+0.01) = 0.9695`，偏差 3.05e-2——不同 token 的 `w` 不同，结果也就不同。这反过来说明：原版之所以恒等于 1，纯粹是 `1e-20` 相对 float32 精度太小造成的舍入，而不是数学上的化简。",
+    "ref": "model/model_minimind.py#L161"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`token_idx = mask.any(dim=-1).nonzero().flatten()` 的输出 shape 是什么？（实验里 E=4、k=1、B*T=21，4 次循环的长度分别是 2 / 1 / 11 / 7）",
+    "options": [
+      "固定是 `[B*T, 1]`，只是里面的值不同",
+      "`[n_i]`，`n_i` 是这一步被路由到 expert i 的 token 数，由数据决定；k=1 时 E 次循环的 `n_i` 之和恰好等于 `B*T`",
+      "固定是 `[E]`，每个位置记一个 expert 的 token 数",
+      "固定是 `[k]`"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`mask` 是 `[B*T, k]` 布尔，`any(dim=-1)` 压成 `[B*T]`，`nonzero()` 返回 `[n_i, 1]` 的下标，`flatten()` 收成一维 `[n_i]`。`n_i` 是**运行时**才知道的——路由结果依赖数据，换一批 token 就变。k=1 时每个 token 恰好被分配一次，所以 2+1+11+7 = 21 = B*T；k=2 时每个 token 出现两次，和会变成 42。",
+    "ref": "model/model_minimind.py#L166"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "把 `y.index_add_(0, token_idx, ...)` 换成普通的索引赋值 `y[token_idx] = ...`，在什么配置下结果会出错？",
+    "options": [
+      "任何配置下都会错，`index_add_` 和赋值语义完全不同",
+      "只有 `norm_topk_prob=False` 时会错",
+      "`num_experts_per_tok ≥ 2` 时会错：同一个 token 会出现在多个 expert 的 `token_idx` 里，赋值会把先写进去的贡献覆盖掉",
+      "都不会错，两种写法在任何配置下等价"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`y` 在 L162 被初始化成全 0，k=1 时每一行只会被写一次，「加到 0 上」和「赋值」结果相同——实验里 k=1 那组两种写法的最大逐元素差是 `0.00e+00`。k=2 时每一行要被写两次，`y` 的正确值是 `w₁·expert_a(x) + w₂·expert_b(x)`；改成赋值只剩后写的那一项，实验测到最大差 `3.08e-01`。所以代码必须用「加」才能对任意 k 成立。",
+    "ref": "model/model_minimind.py#L168"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "去掉 `elif self.training: y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())` 这一行，什么场景下会出问题？",
+    "options": [
+      "单卡训练时任何 batch 都会报错，因为 `y` 里会留下未初始化的值",
+      "`aux_loss` 的数值会算错，负载统计会漏掉闲置的 expert",
+      "多卡 `DistributedDataParallel` 训练时，如果某个 rank 这一步没有 token 路由到某个 expert，它的参数就掉出了计算图，DDP 等不到梯度会报错，或者必须开启很慢的 `find_unused_parameters=True`",
+      "保存 `state_dict` 时会缺少这个 expert 的参数"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`0 * sum(...)` 数值上恒为 0，不影响任何输出；它的作用纯粹在计算图上——把这个 expert 的每个参数都连进图里，backward 后拿到全 0 的 `.grad` 而不是 `None`。实验用 32 个 expert 配 21 个 token：只有 11 个 expert 分到了 token，但 backward 之后 32 个全都有 `.grad`（闲置那 21 个的梯度绝对值最大是 `0.0e+00`）；改成 `model.eval()` 后这一行不执行，有 `.grad` 的就只剩 11 个。`state_dict` 和 `aux_loss` 都和这一行无关。",
+    "ref": "model/model_minimind.py#L169-L170"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "把 `E` 从 4 改成 8（`coef` 不变），实验表格里「两边都均匀」和「两边都坍缩」两行的 `aux_loss` 会怎么变？",
+    "options": [
+      "均匀那行仍是 `1.00 × coef`；坍缩那行从 `3.88 × coef` 涨到约 `7.76 × coef`——上界是 `E × coef`，跟着 E 走",
+      "两行都翻倍，因为公式里显式乘了 `E`",
+      "均匀那行涨到 `2 × coef`；坍缩那行不变",
+      "两行都不变，`E` 在分子分母上被约掉了"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "均匀时 `Σ f_i P_i = E·(1/E)(1/E) = 1/E`，前面乘的 `E` 正好把它约掉，所以**不管 E 多大，「P 均匀」这一切片上的值恒等于 coef**（实测 E=8 仍是 0.000500；注意 coef 是这个切片上的定值，不是整个式子的全局最小值——让一半 expert 闲置、概率质量却摊在它们身上（f 与 P 错开），E=4 时能低到约 0.67×coef）。坍缩时 `Σ f_i P_i ≈ P_0 = 0.97` 和 E 无关，乘上 `E` 就直接翻倍：E=4 是 3.88×，E=8 是 7.76×（实测 0.003880）。也就是说 expert 越多，这个 loss 对坍缩的惩罚上限越高。",
+    "ref": "model/model_minimind.py#L171-L173"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "一个 `use_moe=True` 的模型切到 `model.eval()` 之后做前向（`router_aux_loss_coef` 仍是 5e-4），`res.aux_loss` 是？",
+    "options": [
+      "按公式照常计算，和 `train()` 下同一批输入的值相同",
+      "取决于有没有传 `labels`",
+      "`None`，因为 `MoeCausalLMOutputWithPast` 里这个字段是可选的",
+      "恒为 0：L171 的 `self.training` 为 False，走 `else` 分支的 `scores.new_zeros(1).squeeze()`，一个不带梯度的标量 0"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "`if self.training and self.config.router_aux_loss_coef > 0:` —— `eval()` 把 `self.training` 置为 False，条件不成立。实验里同一个 4 层模型、同一批输入：`eval()` 下每层 `mlp.aux_loss` 都是 0.0、总和 0.0；`train()` 下每层 5.3e-4 ~ 6.0e-4、总和 0.002237。所以想观察路由是否均衡，绝不能看 eval 下的 `aux_loss`。",
+    "ref": "model/model_minimind.py#L171-L175"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())`——第二个参数（`sum` 的初始值）是为了什么？",
+    "options": [
+      "让纯 dense 模型（列表为空）也返回一个同 device、同 dtype 的标量 tensor，而不是 python 的 `int 0`，下游 `res.loss + res.aux_loss` 才不会类型出岔子",
+      "给每一层的 aux_loss 加一个可学习的偏置",
+      "防止 `sum` 在空列表上抛 `TypeError`（`sum([])` 本身会报错）",
+      "把所有层的 aux_loss 归一化到 `[0, 1]`"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`sum([])` 本身不报错，它返回 python `int 0`——问题在于后面 `loss = res.loss + res.aux_loss`（`trainer/train_pretrain.py:37`）、`.item()`、`.backward()` 这些地方期望的是 tensor。`new_zeros(1).squeeze()` 从 `hidden_states` 继承 device 和 dtype，造一个真正的标量 tensor。实验里 dense 模型两种模式下 `res.aux_loss` 的 shape 都是 `()`，正是这个初始值。",
+    "ref": "model/model_minimind.py#L231"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "用默认配置（k=1、`norm_topk_prob=True`）但把 `router_aux_loss_coef` 设成 0 来训练一个 MoE 模型，router 会怎样？",
+    "options": [
+      "会报错：optimizer 不接受梯度恒为 None 的参数",
+      "`gate.weight` 的梯度只有 1e-9 量级的舍入噪声，router 基本学不到东西，路由模式一直停在随机初始化附近",
+      "没关系：`topk` 的离散选择有 straight-through 估计，梯度照样能传回 gate",
+      "router 会迅速坍缩到单个 expert——正是 aux loss 要防的那种退化"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "两条能到 gate 的路都断了：`topk_idx` 是整数 indices，压根不在计算图里；`topk_weight` 在 k=1 + 归一化下被碾成常数 1.0，反传时分子那条 `1/s` 和分母那条 `-w/s²` 几乎完全相消。实验四行里第一行实测 `7.1e-10`，换种子也稳定在 1e-9 附近——那是 float32 的噪声地板。梯度不是 `None` 而是接近 0 的噪声，所以不会报错，只是白训；也不会「坍缩」，因为坍缩也需要梯度把 gate 推过去。",
+    "ref": "model/model_minimind.py#L160-L161"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n)` 算出来的到底是什么？",
+    "options": [
+      "单独一层里、单个 expert 的参数量",
+      "单独一层里、全部 `num_experts` 个 expert 的参数量之和",
+      "全部 `num_experts` 个 expert 跨全部 `num_hidden_layers` 层加总的参数量",
+      "「0 号 expert 槽位」跨全部 `num_hidden_layers` 层加总的参数量——`'mlp.experts.0.'` 这个子串在每一层的参数名里都会命中一次"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "参数名形如 `model.layers.0.mlp.experts.0.gate_proj.weight`、`model.layers.1.mlp.experts.0.gate_proj.weight`……子串在每层都匹配，所以 `sum` 已经是跨层加总的结果，只是每层都只取了 0 号那一个（同层内各 expert 结构相同，取哪个都一样）。实测默认配置下单层单个 expert 是 `3·C·moe_I = 5,603,328`，×8 层 = 44,826,624，就是这个变量的值（源码里再除以 `1e6`，显示成 44.83M）。正因为已经跨层加总，后面 `expert * n_routed` / `expert * n_active` 都**不需要**再乘一次 `num_hidden_layers`。",
+    "ref": "trainer/trainer_utils.py#L23"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "把 `num_experts` 从 4 改成 8（`num_experts_per_tok` 仍是 1），`total` 和 `active` 分别怎么变？",
+    "options": [
+      "`total` 不变，`active` 翻倍",
+      "两个都翻倍",
+      "`total` 从 198.42M 涨到 377.75M，`active` 几乎不动（63.94M → 63.96M，只多了 gate 从 `[4,C]` 变成 `[8,C]` 的那点参数）",
+      "两个都不变，`num_experts` 只影响路由不影响参数量"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`total` 里每层多了 4 个 expert，`4 × 5,603,328 × 8 层 ≈ 179M`，所以涨到 377.75M。但 `active = base + expert × k`：`base` 是「减掉所有 expert 之后剩下的」，多几个 expert 就多减几个，它只多了 router 变宽的 `768×4×8 = 24,576`；`expert × k` 里 k 仍是 1，一个槽位的大小也没变。这正是 MoE 的卖点——**用 total 换容量，不用 active 换计算量**。",
+    "ref": "trainer/trainer_utils.py#L25-L26"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "实验热力图里第 6 层是 32 / 9 / 0 / 3，expert 2 一个 token 都没拿到。这一步 forward 里 expert 2 会发生什么？",
+    "options": [
+      "`nonzero()` 返回空张量会让 `index_add_` 抛 `RuntimeError`",
+      "`mask.any()` 为 False，跳过 `token_idx` / `index_add_` 那三行；`train()` 下走 `elif` 造一条值为 0 的梯度路径，`eval()` 下什么都不做",
+      "会触发 capacity 机制，从别的 expert 匀一个 token 过来",
+      "它的输出按 0 权重加进 `y`，和 dense FFN 的效果一样"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`if mask.any():` 为 False 时整个 if 体被跳过，这个 expert 的 SwiGLU 一次都不跑（也就不存在空张量传给 `index_add_` 的问题）。接着的 `elif self.training` 只在训练时执行，造一条 `0 * sum(参数)` 的假梯度路径给 DDP 用。MiniMind 没有 capacity factor / token dropping，也没有「按 0 权重也算一遍」这种设计——闲置就是真的不算。这也说明「8 层加总 92/93/79/88 很均衡」并不代表每层都均衡。",
+    "ref": "model/model_minimind.py#L165-L170"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "保持 `num_experts_per_tok=1`，把 `num_experts` 从 4 加到 16，前馈层的前向耗时明显变慢（本机实测相对 dense 从约 1.3× 变成约 3.0×）。主要原因是？",
+    "options": [
+      "激活参数从 5.6M 涨到 22.4M，浮点运算量涨了 4 倍",
+      "每个 token 要依次过 16 个 expert",
+      "`softmax` 在 16 维上比在 4 维上慢得多",
+      "`for i, expert in enumerate(self.experts)` 从 4 次变成 16 次——多出来的是 Python 解释 + 临时张量分配 + 小 kernel 启停的固定成本，而一个 token 实际过的参数仍是 5.6M"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "实验表格第四列「一个 token 实际过的参数」三行都是 5.6M：top-1 下每个 token 永远只过一个 expert，`E` 变大不改变 FLOPs，只改变循环次数。每次循环都要做「布尔索引取子批 → 3 个 Linear → 乘权重 → `index_add_` 写回」，token 被切得越碎，每个小矩阵乘法越不划算。把 `T` 从 53 加到 400 再跑，倍数掉回 1.00× / 1.34×——固定开销被摊薄了，这也反过来证明它是固定成本而非计算量。",
+    "ref": "model/model_minimind.py#L163-L168"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "`MiniMindBlock.forward` 里写的是 `hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))`。把 `self.mlp` 从 `FeedForward` 换成 `MOEFeedForward` 之后，这一行要改吗？",
+    "options": [
+      "不用改：两者都是 `[B,T,C] → [B,T,C]`，而 `aux_loss` 是以 `self.aux_loss` 属性（副作用）的形式往外传的，不占用返回值",
+      "要改成接收两个返回值 `hidden_states, aux = self.mlp(...)`",
+      "要在外面手动把 `[B*T,C]` reshape 回 `[B,T,C]`",
+      "要把 `aux_loss` 加到 `hidden_states` 上一起参与残差"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`MOEFeedForward.forward` 最后一行是 `return y.view(batch_size, seq_len, hidden_dim)`，进出 shape 和 dense 版完全一致，所以对 `MiniMindBlock` 是纯黑盒替换（`model_minimind.py:184` 那个三目表达式就是全部改动）。`aux_loss` 走的是另一条路：每层把它挂在自己的模块实例上，`MiniMindModel.forward` 结束前用 `sum([l.mlp.aux_loss for l in self.layers ...])` 统一收集（L231）。这种「用副作用传旁路信息」的写法很省事，代价是必须记得 `eval()` 下它是 0。",
+    "ref": "model/model_minimind.py#L184"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "`MiniMindConfig(use_moe=True, num_experts=8, num_experts_per_tok=2)`，输入 `input_ids` 是 `[B=5, T=11]`。某一层 MoE 里 `scores` / `topk_idx` / `mask` / `load` 的 shape 依次是？",
+    "options": [
+      "`[55,8]` / `[55,2]` / `[55,2]` / `[2,8]`",
+      "`[5,11,8]` / `[5,11,2]` / `[5,11,2]` / `[8]`",
+      "`[55,8]` / `[55,2]` / `[55,2]` / `[8]`",
+      "`[55,8]` / `[55,8]` / `[55,8]` / `[8]`"
+    ],
+    "answer": [
+      0
+    ],
+    "explain": "`B*T = 55`，`E = 8`，`k = 2`。`scores` 是 `[B*T, E] = [55,8]`；`topk` 把最后一维换成 k，得到 `[55,2]`；`mask = (topk_idx == i)` 和 `topk_idx` 同形。最容易错的是 `load`：`F.one_hot(topk_idx, E)` 得到 `[55, 2, 8]`，`.mean(0)` 只压掉第 0 维，剩下 `[k, E] = [2, 8]`——**不是** `[E]`。它靠广播和 `[8]` 的 `scores.mean(0)` 相乘，结果仍然正确，但 `load.sum()` 等于 k 而不是 1，所以 k≥2 时 aux_loss 会被整体放大约 k 倍。",
+    "ref": "model/model_minimind.py#L159-L172"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "把 `moe_intermediate_size` 从默认的 2432 改成 1216（其余不变），下面哪一个数**不会**变？",
+    "options": [
+      "`total`（全部参数）",
+      "`active`（激活参数）",
+      "单层单个 expert 的参数量 `3·C·moe_I`",
+      "`base`（减掉全部 expert 之后剩下的 embedding + attention + norm + gate）"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "`moe_intermediate_size` 只决定每个 expert 内部 SwiGLU 的宽度，`base = total − expert × E` 里恰好把 expert 全部减掉了，所以它只剩 embedding、attention、norm、gate——这些都和 `moe_I` 无关。实测两种配置下 `base` 都是 19,110,144，而 `total` 从 198,416,640 掉到 108,763,392、`active` 从 63,936,768 掉到 41,523,456、单层单个 expert 从 5,603,328 减半成 2,801,664。顺带一提，`moe_intermediate_size` 默认取 `self.intermediate_size`（`model_minimind.py:43`），所以默认每个 expert 和 dense FFN 一样宽。",
+    "ref": "trainer/trainer_utils.py#L23-L26"
+  },
+  {
+    "id": "q20",
+    "type": "single",
+    "question": "把 `num_experts_per_tok` 从 1 改成 2（其余默认），下面哪一件事**不会**发生？",
+    "options": [
+      "`active` 从 63.94M 涨到 108.76M",
+      "`total` 也跟着翻倍，因为每个 token 要用两个 expert",
+      "归一化那一行从「恒等于 1.0」变成两个数之间的真除法，主 loss 开始能给 `gate.weight` 传有意义的梯度",
+      "`aux_loss` 大约翻倍（`load` 的 shape 是 `[k,E]`，`load.sum()` 从 1 变成 2）"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "`total` 只由「模型里存了多少参数」决定，和每个 token 走几个 expert 完全无关——实测 k=1 和 k=2 的 `total` 都是 198,416,640。另外三项都会发生：`active = base + expert × k`，多算一个 expert 槽位就是 `19,110,144 + 44,826,624×2 = 108,763,392`；归一化变成真除法后 `gate.weight.grad` 从 7.1e-10 跳到 2.8e-2；`load.sum()` 从 1 变成 2，2 层小模型的 aux_loss 实测从 1.1e-3 变成 2.1e-3。",
+    "ref": "trainer/trainer_utils.py#L26"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "`E=4`、`coef=5e-4`。现在构造这样一种极端情况：**所有 token 都被路由到 expert 0**（`load` 完全坍缩），但 gate 的平均概率 `P = scores.mean(0)` 仍然是完全均匀的 `[0.25, 0.25, 0.25, 0.25]`。这时 `aux_loss` 大约是多少？",
+    "options": [
+      "接近上界 `E × coef = 2e-3`——负载已经完全坍缩了",
+      "介于两者之间，大约 `2 × coef = 1e-3`",
+      "恰好等于 `coef = 5e-4`，和「两边都均匀」时一模一样",
+      "0，因为 `f` 和 `P` 不匹配时点乘会被抵消"
+    ],
+    "answer": [
+      2
+    ],
+    "explain": "`Σ f_i P_i` 在 `P` 均匀时等于 `Σ f_i · (1/E) = (1/E)·Σ f_i = 1/E`，**和 `f` 长什么样完全无关**；乘上前面的 `E` 就是 1，再乘 `coef` 正好是 `coef`。实验第三行实测 0.000500，和第一行（两边都均匀）一模一样。所以这个 loss 罚的不是「负载不均」本身，而是「router 的选择 `f` 和 router 的信心 `P` 一起集中在同一批 expert 上」。这也符合它的工作方式——梯度只能通过可导的 `P` 回传，`f` 来自不可导的 top-k。",
+    "ref": "model/model_minimind.py#L172-L173"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "保持 `num_experts_per_tok=1`、`router_aux_loss_coef=0`（关掉 aux loss），只把 `norm_topk_prob` 从 `True` 改成 `False`（即跳过那一行归一化）。一次 `backward()` 之后 `gate.weight.grad` 的绝对值最大约是多少量级？",
+    "options": [
+      "仍然是 1e-9 量级的噪声——`torch.topk` 的选择本来就不可导，改不改归一化都一样",
+      "1e-2 量级，和 k=2 时差不多：`topk_weight` 保留了原始概率值，它直接乘在 expert 输出上，这条路是通的",
+      "1e-4 量级，比开 aux loss 略小",
+      "精确的 0，autograd 会把整个 gate 从计算图里摘掉"
+    ],
+    "answer": [
+      1
+    ],
+    "explain": "实验第三行实测 `1.2e-2`，和第四行（k=2）的 `2.8e-2` 同一量级，比第一行的 `7.1e-10` 高了七个数量级。关键在于：`y` 的每一行是 `topk_weight × expert(x)`，只要 `topk_weight` 还带着 gate 的数值信息，主 loss 就能顺着这个乘法回传到 `gate.weight`。真正掐断这条路的是 k=1 时那一行 `w/(w+1e-20) ≡ 1.0` 的归一化，而不是 `topk` 的离散选择本身。换句话说，MiniMind 默认配置对 aux loss 的依赖，是 `norm_topk_prob=True` 和 `k=1` 撞在一起的结果。",
+    "ref": "model/model_minimind.py#L161"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "`full_sft_768_moe.pth` 这份训练过的权重上，8 层加总后 4 个 expert 接到的 token 数是 92 / 93 / 79 / 88，相当均衡。那么**单独看每一层**呢？",
+    "options": [
+      "每一层都同样接近均衡，每个 expert 大约 9~13 个 token",
+      "偏斜只出现在第 0 层（还没学好），越往深层越均衡",
+      "每一层都只用一个 expert，是各层轮流用不同 expert 才让总数看起来均衡",
+      "多数层大致均衡，但至少有一层严重偏科，某个 expert 一个 token 都没拿到"
+    ],
+    "answer": [
+      3
+    ],
+    "explain": "热力图里第 0 层确实是 13/11/9/11、几乎完美均衡，但第 6 层是 **32 / 9 / 0 / 3**——expert 0 独吞 73%，expert 2 拿到 0 个；第 5 层 15/6/2/21、第 7 层 1/18/14/11 也明显偏科。方向恰好和 B 说的相反：深层更偏。总量均衡是各层偏科方向互相抵消的结果。这也说明 `MOEFeedForward` 里那条 `elif self.training` 分支不是杞人忧天——真实模型、真实文本上，某层某个 expert 完全闲置是会发生的。",
+    "ref": "model/model_minimind.py#L159-L160"
+  }
+]

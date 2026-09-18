@@ -1,0 +1,391 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "模型这一轮输出了 `<tool_call>{\"name\": \"get_exchange_rate\", \"arguments\": {\"from_currency\": \"USD\"}}</tool_call>`（少了必填的 `to_currency`）。`rollout_single` 这一轮会发生什么？",
+    "options": [
+      "`parse_tool_calls` 发现参数不合法，返回空 list，轨迹立刻 `break`",
+      "`CHECK_ARGS` 不通过，于是 `execute_tool` 被跳过，塞回对话的是 `{\"error\": \"tool not found\"}`",
+      "`execute_tool` 抛 `KeyError`，被裸 `except` 吞掉返回 `None`",
+      "`CHECK_ARGS` 不通过只影响 reward；`execute_tool` 照样执行，返回 `{\"from\": \"USD\", \"to\": null, \"rate\": 1.0}` 并塞回对话"
+    ],
+    "answer": [3],
+    "explain": "三张表各管各的。`parse_tool_calls`（trainer/train_agent.py:77）只看 `<tool_call>` 标签里的内容能不能 `json.loads`，根本不认识「必填参数」这回事；`CHECK_ARGS`（trainer/train_agent.py:67）只在 `calculate_rewards` 里被查一次，用来数 `valid_call_count`；`execute_tool`（trainer/train_agent.py:84）直接从 `MOCK_RESULTS` 取 lambda 执行，而 `get_exchange_rate` 的实现全是 `args.get(...)`，缺参数就得到 `None`，再 `EXCHANGE_DATA.get((\"USD\", None), 1.0)` 拿到默认汇率 1.0。lab `tool_parse` 的 case ⑧ 就是它：「CHECK_ARGS 通过」那列是 False，「execute_tool 返回」那列却有结果。",
+    "ref": "trainer/train_agent.py#L84"
+  },
+  {
+    "id": "q2",
+    "type": "multi",
+    "question": "下面哪些模型输出会让 `parse_tool_calls` 返回空 list，从而让 `rollout_single` 在这一轮直接 `break`？（多选）",
+    "options": [
+      "`<tool_call>\\n{name: calculate_math}\\n</tool_call>`（JSON 非法，键没加引号）",
+      "`<tool_call>\\n{\"name\": \"calculate_math\", \"arguments\": {\"expression\": \"1+1\"}}`（只有开标签，没闭合）",
+      "`好的，我先算一下。\\n<tool_call>\\n{\"name\": \"unit_converter\", …}\\n</tool_call>`（标签前面有自然语言）",
+      "`<tool_call>\\n{\"name\": \"search_web\", \"arguments\": {\"query\": \"x\"}}\\n</tool_call>`（工具名不在 TOOLS 里）"
+    ],
+    "answer": [0, 1],
+    "explain": "`parse_tool_calls` 只有两个关卡：正则 `<tool_call>(.*?)</tool_call>` 必须**成对闭合**才匹配得上（所以 B 一条都抠不出来），抠出来的字符串必须能 `json.loads`（所以 A 被 `except: pass` 丢弃）。C 的正则是 `re.findall`，不要求标签在开头，照样匹配到 1 条；D 的 JSON 完全合法，也会解析出 1 条——工具名存不存在是后面 `execute_tool` / `CHECK_ARGS` 的事，和解析无关（lab `tool_parse` 里 ⑤⑥ 解析出 0 条、③⑦ 解析出 1 条）。解析出 0 条的直接后果写在 trainer/train_agent.py:131：`if not calls: break`。",
+    "ref": "trainer/train_agent.py#L77"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "chat_template 把 `{\"role\": \"tool\", \"content\": \"{...}\"}` 渲染成什么？",
+    "options": [
+      "`<|im_start|>tool\\n{...}<|im_end|>\\n`",
+      "`<|im_start|>user\\n<tool_response>\\n{...}\\n</tool_response><|im_end|>\\n`",
+      "裸的 `<tool_response>{...}</tool_response>`，不加任何 `<|im_start|>`",
+      "`<|im_start|>assistant\\n<tool_response>\\n{...}\\n</tool_response><|im_end|>\\n`"
+    ],
+    "answer": [1],
+    "explain": "模板里 `{%- elif message.role == \"tool\" %}` 分支先判断 `loop.first or messages[loop.index0-1].role != \"tool\"` 才补 `<|im_start|>user`，然后写 `\\n<tool_response>\\n` + content + `\\n</tool_response>`，最后判断 `loop.last or 下一条不是 tool` 才补 `<|im_end|>\\n`。所以**工具结果在模型眼里是一条 user 消息**，而且连续多条 tool 只会被包在同一对 `<|im_start|>user … <|im_end|>` 里。词表里压根没有 `tool` 这个 role。lab `tool_template` 的彩带里可以直接数出这一段。",
+    "ref": "model/tokenizer_config.json#L333"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "第 2 轮生成时，送进 `rollout_engine.rollout` 的 `input_ids` 是怎么来的？",
+    "options": [
+      "把新的 `context` 重新 `apply_chat_template` + tokenize 得到",
+      "`prompt_ids`（第 1 轮算的那份）+ 一路累积的 `response_ids`",
+      "直接复用上一轮 `rollout_result.output_ids`",
+      "只把这一轮新增的 `<tool_response>` 段喂进去，靠 KV cache 接上"
+    ],
+    "answer": [1],
+    "explain": "trainer/train_agent.py:109-111：`prompt_ids` 只在 `is None` 时算一次，之后每轮都是 `torch.tensor([prompt_ids + response_ids])`。`context` 每轮确实重算了（第 108 行），但只用来拼 `final_context` 给 debug 打印。之所以敢这么做，是因为 chat_template 对同一段历史的渲染是**严格前缀一致**的——lab `tool_template` 里 `t2[:len(t1)] == t1` 打出 True 就是这个前提。至于 KV cache：轮与轮之间并没有复用，每轮都是全量重放，`generate` 内部自己建一份新的 cache。",
+    "ref": "trainer/train_agent.py#L109"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "`rollout_single` 里调的是 `rollout_engine.rollout(..., num_generations=1)`，可 `--num_generations` 默认是 4。同一个 prompt 的那 4 条轨迹是在哪里产生的？",
+    "options": [
+      "`rollout` 内部会忽略传进来的 1，实际按 `args.num_generations` 一次生成 4 条",
+      "`rl_train_epoch` 先把 batch 复制 4 份，再调一次 `rollout_batch`",
+      "`rollout_batch` 的内层循环：对每个样本串行跑 4 次完整的多轮 episode",
+      "`calculate_rewards` 里用 `repeat_interleave` 把 1 条扩成 4 条"
+    ],
+    "answer": [2],
+    "explain": "trainer/train_agent.py:174-177 是双层循环：外层 `for messages, tools in zip(messages_batch, tools_batch)`，内层 `for _ in range(num_gen)`，每次都 `[dict(m) for m in messages]` 深拷贝一份再跑一整条 `rollout_single`。之所以不能像 Day 13 的 GRPO 那样一次 `generate` 出 G 条，是因为多轮轨迹会**分叉**：第一轮调了不同的工具，第二轮的上下文就完全不同了。这个「sample0 的 G 条、sample1 的 G 条……」的排列顺序，也正是后面组内归一化必须用 `repeat_interleave` 的原因。",
+    "ref": "trainer/train_agent.py#L174"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`trainer/train_agent.py:145-151` 往 assistant 内容尾部塞了一个 `<|agent_observation_…|>` marker，它的作用是？",
+    "options": [
+      "作为新的 special token 加进词表，让模型显式知道「这里开始是环境返回」",
+      "纯文本哨兵：渲染完整模板后用 `str.partition(marker)` 精确切出「本轮 assistant 内容之后模板新增的那一截文本」",
+      "给 `calculate_rewards` 定位最后一轮答案用",
+      "给 tokenizer 做 padding 对齐用的占位符"
+    ],
+    "answer": [1],
+    "explain": "第 145 行用 `id(messages)` 和 `len(response_ids)` 拼了一个几乎不可能撞车的字符串，第 147 行把带 marker 的 messages 渲染一遍，第 149 行 `marked_context.partition(marker)` 拿到 marker 之后的部分 = 观测增量；第 148 行立刻把 content 还原，第 155 行再用干净的 messages 渲染一次。它从头到尾只是个字符串哨兵，不进词表。为什么不能简单地「减前缀」？因为模板会对 assistant 内容做 `</think>` 拆分重组、`rstrip('\\n')` / `lstrip('\\n')`——lab `obs_marker` 里 5 个 case 只有 2 个减前缀成立，而 marker 5 个全中。第 150-151 行的 `if not found: raise` 就是在防「模板把 marker 吃掉」。",
+    "ref": "trainer/train_agent.py#L145"
+  },
+  {
+    "id": "q7",
+    "type": "multi",
+    "question": "`rollout_single` 跑完一条两轮轨迹后，`response_mask` 里**取值为 0** 的是哪些 token？（多选）",
+    "options": [
+      "模型自己生成的 `<tool_call>` / `</tool_call>` 标签",
+      "模型生成的、结束第一轮的 `<|im_end|>`",
+      "工具结果被模板包出来的 `<|im_start|>user\\n<tool_response>…</tool_response>` 整段",
+      "第二轮开头的 generation prompt `<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n`"
+    ],
+    "answer": [1, 2, 3],
+    "explain": "两处赋值：trainer/train_agent.py:127 给模型生成的 token 写 `int(t != tokenizer.eos_token_id)`——所以生成的正文（含 `<tool_call>` 标签）是 1，**但 eos 本身是 0**；trainer/train_agent.py:157 给观测增量 `obs_delta` 统一写 `[0] * len(obs_delta)`，而 `obs_delta` 正是「assistant 内容之后模板新增的全部文本」，既包含 `<tool_response>` 段，也包含下一轮的 generation prompt。lab `response_mask` 的彩带能一眼看到这三段 0：90 个 token 里只有 54 个是 1，三个 eos 分别落在下标 37 / 59 / 89，mask 全是 0。",
+    "ref": "trainer/train_agent.py#L127"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "打包时写的是 `old_logps = [0.0] * max(len(p) - 1, 0) + old_lp`。某条轨迹 `len(prompt_ids) = 234`，response 的第 0 个 token 落在 `input_ids[234]`。它的旧 logprob 在 `old_per_token_logps` 里的下标是？",
+    "options": [
+      "234",
+      "0 —— `old_lp` 的第一个元素就排在最前面",
+      "233",
+      "235"
+    ],
+    "answer": [2],
+    "explain": "per-token 量的下标 `j` 表示「用位置 `j` 的 hidden state 预测 `input_ids[j+1]`」，所以它整体比 token 下标**左移一位**，长度也少 1（`logits = res.logits[:, :-1, :]`）。response 第 0 个 token 在 `input_ids` 里是 234，预测它的是位置 233，于是它的 logprob 落在 `old_per_token_logps[233]`——这正是前面只填 `len(p)-1 = 233` 个 0.0 的原因。写成 `len(p)` 就会整体错开一格：不报错，但每个 token 都配上了别人的旧概率，`ratio = exp(new - old)` 全是错的。lab `packing` 最后几行把 `full_response_masks[0][233:235]`（`[0.0, 1.0]`）和 `old_per_token_logps[0][232:235]`（`[0.0, -0.7, -0.7]`）打在一起：填充的 0.0 正好在下标 232 结束，233 开始才是 rollout 攒下来的真实 logprob。",
+    "ref": "trainer/train_agent.py#L264"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "一条轨迹：只调了 1 次**不存在**的工具 `search_web`，最后一轮的回答里含有唯一的 gt，`unfinished=False`，标签配对正确、无复读。`calculate_rewards` 给它多少分？",
+    "options": ["-1.0", "0.5", "1.5", "3.0"],
+    "answer": [2],
+    "explain": "走「有工具调用」分支：`valid_call_count = 0`（名字不在 `valid_names` 里），`tool_gap = |0 - 1| + max(0, 1 - 0) = 2`，所以 tool 对齐分是 `-0.5 × 2 = -1.0`（trainer/train_agent.py:236-237）；最后一轮答案里没有 `</tool_call>`，`final_text = answer`，GT 命中 1/1 → `+2.5`（第 241 行）。合计 `1.5`。lab `reward_parts` 的 case E 就是它。注意这个设计的味道：**答案对了就能拿大头分，工具调错只扣一点**——因为 GT 命中分是 2.5，比整个 tool 对齐项大一个量级。",
+    "ref": "trainer/train_agent.py#L236"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "`unfinished` 什么时候为 `True`？它带来的直接后果是什么？",
+    "options": [
+      "工具执行失败（`execute_tool` 返回 `None`）时为 True，后果是这条轨迹被丢弃",
+      "生成 token 数打满 `max_new_tokens` 时为 True，后果是 `-0.5`",
+      "模型没吐 eos 时为 True，后果是 `completion_mask` 全 0",
+      "在第 `max_turns` 轮（最后一轮）模型**仍然**解析出了 tool_call 时为 True，后果是 `final_text` 被强制置空 + 额外 `-0.5`"
+    ],
+    "answer": [3],
+    "explain": "第 133 行 `unfinished = turn == max_turns - 1` 写在 `if not calls: break` 之后——只有「这一轮解析出了 tool_call」才会走到，所以含义是「轮数用光了还在调工具，等于没给出最终答案」。后果在第 239 行：`final_text = \"\" if unfinished else …`，于是 `validate_gt_in_text` 必然命中 0 个、GT 分归零；再加第 242 行的 `-0.5`。lab `reward_parts` 的 case D（连调三轮）总分是 -1.533：`tool_gap=2` 扣 1.0、未完成扣 0.5、复读再扣 0.033。另外第 147/155 行的 `add_generation_prompt=not unfinished` 说明最后一轮不再补 assistant 提示符。",
+    "ref": "trainer/train_agent.py#L133"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`--batch_size 2 --num_generations 4`，某个 step 里 padding 后 `max_len = 600`。下面哪个 shape 是**错的**？",
+    "options": [
+      "`input_ids` → `[8, 600]`",
+      "`old_per_token_logps` → `[8, 599]`",
+      "`completion_mask` → `[8, 599]`",
+      "`advantages` → `[2, 4]`"
+    ],
+    "answer": [3],
+    "explain": "`rewards` 的长度是 `len(completions) = batch_size × num_generations = 8`（trainer/train_agent.py:195）。`grouped_rewards = rewards.view(-1, num_generations)` 才是 `[2, 4]`（第 320 行），而 `advantages = (rewards - mean_r) / (std_r + 1e-4)` 仍然是**一维 `[8]`**（第 323 行），用的时候再 `advantages.unsqueeze(1)` 变 `[8, 1]` 去和 `[8, 599]` 广播。另外三个：`input_ids` 第 273 行 `[8, 600]`；`old_per_token_logps` 第 276 行 pad 到 `max_len - 1 = 599`；`completion_mask = full_response_masks[:, 1:]` 第 291 行也是 `[8, 599]`。",
+    "ref": "trainer/train_agent.py#L320"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`parse_response('<tool_call>{\"name\": \"x\", \"arguments\": }</tool_call>后半段')` 的返回是？",
+    "options": [
+      "`('后半段', None, [1 条 tool_call])`",
+      "`('', None, None)`",
+      "`('<tool_call>{\"name\": \"x\", \"arguments\": }</tool_call>后半段', None, None)`——原文一字没动",
+      "抛 `json.JSONDecodeError`"
+    ],
+    "answer": [2],
+    "explain": "scripts/serve_openai_api.py:94-99：正则确实匹配到了一段，但 `json.loads` 失败被 `except Exception: pass` 吞掉，`tool_calls` 仍是空 list；接着第 100-101 行 `if tool_calls:` 为假，**那句把标签 `re.sub` 掉的清理就不会执行**，所以标签连同非法 JSON 原封不动留在 content 里返回给客户端。这是「解析失败时的降级行为」——客户端至少能看到一段带标签的文本，而不是一个空 message。lab `parse_response` 的 case ⑤ 复现了它；把 JSON 补合法之后再跑，content 只剩下标签之外的 `'后半段'`，`finish_reason` 变成 `tool_calls`。",
+    "ref": "scripts/serve_openai_api.py#L100"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`convert_torch2transformers_minimind` 导出的目录里，把 `config.json` 的 `auto_map` 字段删掉，再 `AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)` 会怎样？",
+    "options": [
+      "照样能加载：`model_minimind.py` 还在目录里，transformers 会自动扫描目录下的 .py",
+      "加载成功，但类退化成 `LlamaForCausalLM`，logits 对不上",
+      "加载失败，报 `ValueError: The checkpoint you are trying to load has model type 'minimind' but Transformers does not recognize this architecture`",
+      "加载成功，但权重全是随机初始化的"
+    ],
+    "answer": [2],
+    "explain": "`trust_remote_code=True` 只是「允许执行模型目录里自带的代码」，它并不会去猜该执行哪个文件、实例化哪个类——这个映射完全写在 `config.json` 的 `auto_map` 里（`{\"AutoConfig\": \"model_minimind.MiniMindConfig\", \"AutoModelForCausalLM\": \"model_minimind.MiniMindForCausalLM\"}`），而这两行映射正是 scripts/convert_model.py:17-18 的 `register_for_auto_class()` 让 `save_pretrained` 顺手写下的。删掉它之后 transformers 只剩 `\"model_type\": \"minimind\"`，在内置注册表里查不到，于是报错。lab `convert_roundtrip` 的第一个 task 就是让你亲手删一次。",
+    "ref": "scripts/convert_model.py#L17"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`scripts/eval_toolcall.py` 的 `run_case` 和 `trainer/train_agent.py` 的 `rollout_single` 是什么关系？",
+    "options": [
+      "`run_case` 直接调用了 `rollout_single`，只是不传 reward_model",
+      "`run_case` 只支持单轮，多轮必须用 `rollout_single`",
+      "两者共用同一份 `MOCK_RESULTS`，所以同样的工具调用返回完全一致",
+      "两者是同构的多轮循环（生成 → parse → 执行 → 以 `role=tool` 追加 → 再生成），但 `run_case` 不攒 mask、不算 reward，也不做增量 token 拼接"
+    ],
+    "answer": [3],
+    "explain": "scripts/eval_toolcall.py:177-199 的 `run_case` 是个 `while True`：`generate` → `parse_tool_calls` → `execute_tool` → `messages.append({\"role\": \"tool\", ...})` → 再来一轮，结构和 `rollout_single` 一模一样，但它每轮都重新 `apply_chat_template` 整段 tokenize（不需要增量 token），也不需要 `response_mask` / `old_logps` / reward。C 是个常见误解：`eval_toolcall.py` 有**自己的一套** `MOCK_RESULTS`（第 29-38 行），`get_current_time` 返回真实时间，还多了 `random_number` / `text_length`，和 `train_agent.py` 那套不是同一份。",
+    "ref": "scripts/eval_toolcall.py#L177"
+  },
+  {
+    "id": "q15",
+    "type": "multi",
+    "question": "同一串 `input_ids`（一条两轮工具调用轨迹）上，下面哪些位置是「SFT 会监督、而 Agent RL 的 `response_mask` 是 0」？（多选）",
+    "options": [
+      "assistant 段开头模板补的 `<think>\\n\\n</think>\\n\\n`",
+      "模型自己写的 `<tool_call>…</tool_call>` 正文",
+      "结束这一轮的 `<|im_end|>`（SFT 里连同紧跟的换行一起算）",
+      "`<|im_start|>user\\n<tool_response>…</tool_response>` 那一整段工具结果"
+    ],
+    "answer": [0, 2],
+    "explain": "`SFTDataset.generate_labels`（dataset/lm_dataset.py:88-105）从 `<|im_start|>assistant\\n` **之后**一直标到 `<|im_end|>\\n` **之内**，所以模板补的空 think 壳和结尾的 `<|im_end|>\\n` 都算监督；而 `response_mask` 只有模型真正生成的 token 是 1，think 壳是模板补的（`obs_delta` 的一部分）、eos 被第 127 行显式置 0，两处都是 0。B 两边都是 1（模型自己写的正文）。D 两边都是 0——工具结果被渲染成 user 消息，SFT 也不监督 user 段。lab `recap_mask` 把同一条 324 token 的序列按「两者取值相同」折叠，正好剩下 4 段不一致：两个 think 壳、两个 `<|im_end|>`。",
+    "ref": "dataset/lm_dataset.py#L99"
+  },
+
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "`completion_mask = full_response_masks[:, 1:]` 之后，紧跟着 `is_eos = (input_ids[:, 1:] == tokenizer.eos_token_id) & completion_mask.bool()`。这条两轮轨迹的序列里明明有好几个 eos，`is_eos.any()` 会是什么？",
+    "options": [
+      "True，`eos_idx` 指向 response 里第一个 eos",
+      "True，但只有最后一个 eos 会被标出来",
+      "False —— 一个都标不出来，后面整段截断逻辑空转",
+      "直接报错：`completion_mask` 是 float，不能和 bool 做 `&`"
+    ],
+    "answer": [2],
+    "explain": "`is_eos` 要求两个条件同时成立：这个位置是 eos，**并且** `completion_mask` 在这里非 0。但 `response_mask` 在 trainer/train_agent.py:127 已经把所有 eos 位置写成 0 了（`int(t != eos_token_id)`），prompt 段又整段是 0，所以「是 eos」和「mask 非 0」永远不会同时成立 —— `is_eos` 恒为全 False，`has_eos` 全 False，`eos_idx` 保持在最后一列，`pos <= eos_idx` 恒真，`completion_mask` 乘完一点没变。这段代码是从 Day 13 的 GRPO 搬过来的：那边 completion 在 eos 之后是 padding，必须截；这边 mask 约定变了，它就成了空转。D 不成立，`completion_mask.bool()` 会先把 float 转成 bool。lab 里 `token_counts` 截断前后都是 54 就是证据。",
+    "ref": "trainer/train_agent.py#L292"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "同一个 prompt 采出的 4 条轨迹 reward 完全相同（都是 3.0，模型每次都答对）。`advantages = (rewards - mean_r) / (std_r + 1e-4)` 算出来是什么？",
+    "options": [
+      "全是 0",
+      "全是 1（每条都达到了组内最高分）",
+      "全是很大的数，因为分母只剩 1e-4",
+      "`nan`，0 除以 0"
+    ],
+    "answer": [0],
+    "explain": "`mean_r` 是 3.0，`std_r`（`unbiased=False`）是 0.0，所以分子 `rewards - mean_r` 每一项都是 0；分母那个 `+ 1e-4` 只是在防除零，`0 / 1e-4 = 0`，既不会很大也不会 nan。后果是这一组的 `per_token_loss` 里 `advantages` 那一项整体归零，只剩 KL 惩罚 —— **这一步几乎没有策略梯度**。这是 GRPO 家族最常见的失效模式：reward 要么全满要么全零，组内就没有对比信号了。训练日志里的 `GrpStd`（`grouped_rewards.std(dim=1, unbiased=False).mean()`）就是专门盯这件事的，它贴着 0 说明该调采样温度、加大 `num_generations` 或者换更难的数据。",
+    "ref": "trainer/train_agent.py#L323"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "`convert_torch2transformers` 把 MiniMind 的 `state_dict` 原样 `load_state_dict(..., strict=True)` 灌进 `Qwen3ForCausalLM`。fp32 下同一批 `input_ids`，两份实现算出的 logits 差多少？",
+    "options": [
+      "`maxdiff = 0.0`，逐位完全相同",
+      "1e-6 量级：数学等价，但算子实现细节不同会累积浮点误差",
+      "1e-2 量级：RoPE 的 cos/sin 表构造方式不一样",
+      "完全对不上：Qwen3 的 QK-Norm 位置和 MiniMind 不同"
+    ],
+    "answer": [0],
+    "explain": "实测 `maxdiff = 0.0`，不是「误差很小」而是一个 bit 都不差。说明两份实现的算子调用序列完全等价：同样的 `scaled_dot_product_attention`、同样的 RMSNorm 顺序、同样的 `rotate_half` 约定、QK-Norm 同样放在 RoPE 之前。这也解释了 `strict=True` 为什么能过 —— 连参数名都一样（`model.layers.N.self_attn.q_norm.weight` 这种）。顺带记一下：scripts/convert_model.py 里只写了 `Qwen3` 和 `Qwen3Moe` 两个分支，**没有 Llama 分支**，因为 Llama 没有 QK-Norm，`q_norm` / `k_norm` 两个 key 会被 `strict=True` 判成 unexpected。",
+    "ref": "scripts/convert_model.py#L81"
+  },
+
+  {
+    "id": "g1",
+    "type": "single",
+    "question": "【毕业测验·Day 4】默认配置（`num_attention_heads=8`、`num_key_value_heads=4`、`hidden_size=768`），`B=3, T=7`。`Attention.forward` 里 `xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)` 之后、以及 `repeat_kv(xk, self.n_rep).transpose(1, 2)` 之后，xk 的 shape 分别是？",
+    "options": [
+      "`[3, 7, 4, 96]` → `[3, 8, 7, 96]`",
+      "`[3, 4, 7, 96]` → `[3, 8, 7, 96]`",
+      "`[3, 7, 4, 96]` → `[3, 7, 8, 96]`",
+      "`[3, 7, 8, 96]` → `[3, 8, 7, 96]`"
+    ],
+    "answer": [0],
+    "explain": "`head_dim = 768 // 8 = 96`，`n_local_kv_heads = 4`，`n_rep = 8 // 4 = 2`。`view` 之后 KV 头维在第 2 维：`[3, 7, 4, 96]`（`model/model_minimind.py:115`）。`repeat_kv` 是 `x[:, :, :, None, :].expand(...).reshape(bs, slen, kv*n_rep, head_dim)`，只把第 2 维从 4 变 8：`[3, 7, 8, 96]`；**之后**才 `.transpose(1, 2)` 换成 `[3, 8, 7, 96]`（`model/model_minimind.py:124`）。这个顺序很容易记反——MiniMind 是「一直保持 `[B, T, H, D]`，到最后一步才转」。",
+    "ref": "model/model_minimind.py#L124"
+  },
+  {
+    "id": "g2",
+    "type": "single",
+    "question": "【毕业测验·Day 3】`apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)` 的默认 `unsqueeze_dim` 为什么是 1？",
+    "options": [
+      "因为 q 已经是 `[B, H, T, D]`，要在 head 维上广播",
+      "因为 q 此时还是 `[B, T, H, D]`、cos 是 `[T, D]`，`cos.unsqueeze(1)` → `[T, 1, D]` 才能对齐 head 维广播上去",
+      "因为 cos 是 `[B, T, D]`，要补出 head 维",
+      "因为要在 batch 维上广播，`unsqueeze(0)` 会和 T 冲突"
+    ],
+    "answer": [1],
+    "explain": "MiniMind 在 `model/model_minimind.py:119` 调用 RoPE 时，xq/xk 还没 transpose，形状是 `[B, T, H, D]`；`precompute_freqs_cis` 返回的 `freqs_cos/sin` 是 `[max_position_embeddings, head_dim]`，切片后 `[T, D]`。`unsqueeze(1)` 得到 `[T, 1, D]`，广播成 `[B, T, H, D]`。如果照搬 HuggingFace Llama 那份（那边 q 是 `[B, H, T, D]`，`unsqueeze_dim=1` 补的是 head 维）就会错位。顺带：`rotate_half` 用的是**前后半切分**（`-x[..., d//2:]` 拼 `x[..., :d//2]`），不是奇偶交错。",
+    "ref": "model/model_minimind.py#L80"
+  },
+  {
+    "id": "g3",
+    "type": "single",
+    "question": "【毕业测验·Day 4】手写 attention 分支里写的是 `scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), -inf).triu(1)`。为什么只加到最后 `seq_len` 列？",
+    "options": [
+      "为了少算一点，省显存",
+      "因为带 KV cache 时 `scores` 最后一维是 `past_len + seq_len`，**过去的 key 对当前每个 query 都是可见的**，只有当前这 `seq_len` 个位置之间才需要下三角约束",
+      "因为 `triu` 要求输入必须是方阵，没法作用在整个 `scores` 上",
+      "因为前面 `past_len` 列已经被 `attention_mask` 处理过了"
+    ],
+    "answer": [1],
+    "explain": "`model/model_minimind.py:129`。增量解码时 `xk` 是 cache 拼出来的，长度 `past_len + seq_len`，而 query 只有 `seq_len` 个。前 `past_len` 列全是「更早的 token」，无论如何都该看见，不需要遮；只有右下角那个 `seq_len × seq_len` 方块里才有「未来」。选项 C 的说法反了因果：`triu` 作用的是那个新建的 `(seq_len, seq_len)` 矩阵，它天然是方阵；至于 `attention_mask`（padding mask）是第 130 行单独加的，和因果无关。",
+    "ref": "model/model_minimind.py#L129"
+  },
+  {
+    "id": "g4",
+    "type": "single",
+    "question": "【毕业测验·Day 5/8】训练 SFT 时，「logits 和 label 错开一位」这件事发生在哪里？",
+    "options": [
+      "在 `SFTDataset.__getitem__` 里：返回的 labels 已经是 `input_ids[1:]`",
+      "在 `MiniMindForCausalLM.forward` 里：`logits[..., :-1, :]` 对 `labels[..., 1:]`",
+      "在 `F.cross_entropy` 内部自动完成",
+      "在 `lm_head` 里，通过权重共享隐式完成"
+    ],
+    "answer": [1],
+    "explain": "`model/model_minimind.py:251`：`x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()`。`PretrainDataset` / `SFTDataset` 返回的 labels 是**和 input_ids 完全对齐**的（只是把不监督的位置写成 -100），错位交给模型。这里的经典陷阱是 `DPODataset`：它**确实**在 Dataset 里就错好了（`x = input_ids[:-1]`、`y = input_ids[1:]`，`dataset/lm_dataset.py:160-165`），因为 DPO 不走 `forward(labels=...)` 这条路，而是自己 `logits_to_log_probs(logits, y)`。两套约定共存，别搞混。",
+    "ref": "model/model_minimind.py#L251"
+  },
+  {
+    "id": "g5",
+    "type": "single",
+    "question": "【毕业测验·Day 8】`SFTDataset.generate_labels` 把哪些位置从 -100 改成真实 token id？",
+    "options": [
+      "所有非 pad 的 token",
+      "只有 user 段的内容",
+      "assistant 回复的正文，**外加**它后面那两个 token `<|im_end|>` + `\\n`",
+      "只有 assistant 回复的正文，不含结尾的 `<|im_end|>`"
+    ],
+    "answer": [2],
+    "explain": "`dataset/lm_dataset.py:99-100`：`for j in range(start, min(end + len(self.eos_id), self.max_length)): labels[j] = input_ids[j]`。`start` 是 `<|im_start|>assistant\\n` 这 5 个 token 之后，`end` 停在 `eos_id` 开头，而循环上界又 `+ len(self.eos_id)`——`self.eos_id = tokenizer('<|im_end|>\\n')` 正好是 2 个 token（`[2, 234]`）。所以模型**必须学会自己吐 `<|im_end|>`**，否则永远停不下来。对比一下 Day 14：Agent RL 的 `response_mask` 反而把 eos 置 0（`trainer/train_agent.py:127`），两者的取舍完全相反。",
+    "ref": "dataset/lm_dataset.py#L99"
+  },
+  {
+    "id": "g6",
+    "type": "single",
+    "question": "【毕业测验·Day 7】`past_key_value` 里存的 `k` 处于哪个状态？",
+    "options": [
+      "QK-Norm 之前、RoPE 之前，`[B, T, KV, D]`",
+      "QK-Norm + RoPE 之后、`repeat_kv` 之前、transpose 之前，`[B, T, KV, D]`",
+      "`repeat_kv` 之后、transpose 之前，`[B, T, H, D]`",
+      "`repeat_kv` + transpose 之后，`[B, H, T, D]`"
+    ],
+    "answer": [1],
+    "explain": "顺序是：`view`（L115）→ `q_norm/k_norm`（L117）→ `apply_rotary_pos_emb`（L119）→ 和 cache 在 `dim=1` 上 `cat`（L121-122）→ `past_kv = (xk, xv)`（**L123**）→ 才 `repeat_kv(...).transpose(1, 2)`（L124）。所以缓存里是「已经归一化、已经加过位置编码、但还没被复制成 8 个头」的 KV——**这正是 GQA 省显存的地方**：cache 只有 4 个 KV 头而不是 8 个。存成 repeat 之后的形状会白白多占一倍显存。",
+    "ref": "model/model_minimind.py#L123"
+  },
+  {
+    "id": "g7",
+    "type": "single",
+    "question": "【毕业测验·Day 6】`use_moe=True`，`num_experts=4`、`num_experts_per_tok=1`，输入 `x` 是 `[3, 7, 768]`。下面哪句对？",
+    "options": [
+      "`x_flat` 是 `[21, 768]`，`topk_idx` 是 `[21, 1]`，`y.index_add_(0, token_idx, ...)` 沿 **dim 0（token 维）** 把各专家的输出累加回去",
+      "`x_flat` 是 `[3, 5376]`，`topk_idx` 是 `[3, 1]`",
+      "`x_flat` 是 `[21, 768]`，`topk_idx` 是 `[21, 4]`（每个 token 都要过全部专家）",
+      "`x_flat` 是 `[21, 768]`，但 `index_add_` 用的是 `dim=1`，按 hidden 维累加"
+    ],
+    "answer": [0],
+    "explain": "`model/model_minimind.py:158` `x_flat = x.view(-1, hidden_dim)` → `[3*7, 768] = [21, 768]`：**batch 和 seq 被拍平成一个「token 池」**，因为路由是逐 token 的，跟它在哪条序列里无关。`topk` 的 k 是 `num_experts_per_tok=1`，所以 `topk_idx` 是 `[21, 1]`（第 160 行）。第 168 行 `y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight))`：先只把路由到该专家的行挑出来算，再按行号加回 `y`，`dim=0` 就是 token 维。别忘了第 171-173 行的 aux_loss **只在 `self.training` 时才算**，eval 下恒为 0。",
+    "ref": "model/model_minimind.py#L158"
+  },
+  {
+    "id": "g8",
+    "type": "single",
+    "question": "【毕业测验·Day 10】`apply_lora(model, rank=16)` 会给哪些层挂上 LoRA？默认 768/8 头配置下，8 层模型一共挂几个？",
+    "options": [
+      "所有 `nn.Linear`（含 lm_head），共 57 个",
+      "名字里带 `q_proj` / `k_proj` / `v_proj` 的层，共 24 个",
+      "满足 `in_features == out_features` 的 `nn.Linear`——即每层只有 `q_proj`(768→768) 和 `o_proj`(768→768)，共 16 个",
+      "所有 Attention 里的 Linear（q/k/v/o），共 32 个"
+    ],
+    "answer": [2],
+    "explain": "`model/model_lora.py:22` 的条件就一句：`isinstance(module, nn.Linear) and module.in_features == module.out_features`。默认配置下 `k_proj`/`v_proj` 是 768→384（GQA，只有 4 个 KV 头），`gate_proj`/`up_proj` 是 768→2432，`down_proj` 是 2432→768，`lm_head` 是 768→6400——**全都不是方阵**，所以统统不挂。只剩 `q_proj` 和 `o_proj`，8 层共 16 个。这是个很「MiniMind」的偷懒实现：省掉了配置项，但也意味着你想给 FFN 加 LoRA 就得改这一行。",
+    "ref": "model/model_lora.py#L22"
+  },
+  {
+    "id": "g9",
+    "type": "single",
+    "question": "【毕业测验·Day 11】`train_dpo.py` 把 chosen 和 rejected `torch.cat(..., dim=0)` 成一个 batch 跑一次 forward。在 `dpo_loss` 里，chosen 对应哪一半？",
+    "options": [
+      "前一半 `[:batch_size // 2]`",
+      "后一半 `[batch_size // 2:]`",
+      "偶数行 `[::2]`",
+      "看 `mask` 里哪一半非零决定"
+    ],
+    "answer": [0],
+    "explain": "`trainer/train_dpo.py:65-67` 是 `x = torch.cat([x_chosen, x_rejected], dim=0)`（y 和 mask 同理），chosen 在前；对应 `trainer/train_dpo.py:41-44` 的 `[:batch_size // 2]` / `[batch_size // 2:]`。这样拼的好处是 policy 和 ref 各只跑**一次** forward 就拿到 4 组 logp。如果哪天改成交错拼（chosen/rejected 交替），`dpo_loss` 里的切片就得同步改成 `[::2]`/`[1::2]`，否则 loss 依然「能跑」，只是学反了——这类 bug 不会报错，只会让模型越训越差。",
+    "ref": "trainer/train_dpo.py#L41"
+  },
+  {
+    "id": "g10",
+    "type": "single",
+    "question": "【毕业测验·Day 13/14】GRPO 的组内归一化写成 `grouped_rewards.mean(dim=1).repeat_interleave(G)`。把 `repeat_interleave(G)` 换成 `.repeat(G)` 会怎样？",
+    "options": [
+      "完全等价，只是写法不同",
+      "shape 一样都是 `[B*G]`，但元素顺序错位：`repeat_interleave` 给的是 `[m0,m0,…,m1,m1,…]`（和 `rewards` 的排列一致），`repeat` 给的是 `[m0,m1,…,m0,m1,…]`，于是每条轨迹会被减去别的组的均值",
+      "会直接报 shape 错误，因为 `.repeat` 返回 `[B, G]`",
+      "结果一样，但 `.repeat` 更快"
+    ],
+    "answer": [1],
+    "explain": "`rewards` 的排列来自 `rollout_batch` 的双层循环（`trainer/train_agent.py:174-177`：外层 sample、内层 num_gen），所以是「sample0 的 G 条、sample1 的 G 条……」。`mean(dim=1)` 得到 `[B]`，要对齐就必须**逐元素重复** `repeat_interleave`；`.repeat(G)` 是把整个向量平铺 G 遍，顺序完全对不上。两者 shape 都是 `[B*G]`，**不会报错**——这正是它危险的地方。顺带记一下：`advantages` 始终是一维 `[B*G]`，用的时候 `unsqueeze(1)` 去和 `[B*G, L-1]` 的 per-token 量广播（`trainer/train_agent.py:330`）。",
+    "ref": "trainer/train_agent.py#L321"
+  }
+]

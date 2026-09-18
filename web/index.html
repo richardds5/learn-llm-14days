@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMind · 14 天手搓 LLM</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="/style.css">
+<script>
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('mm-theme'); } catch (e) {}
+    if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <a class="brand" href="#/">
+      <span class="brand-mark">🧠</span>
+      <span><b>MiniMind</b><small>14 天读透一个 LLM 的全部实现</small></span>
+    </a>
+    <div class="overall">
+      <div class="overall-row"><span>总进度</span><span id="overall-text">0 / 14</span></div>
+      <div class="bar"><i id="overall-bar"></i></div>
+    </div>
+    <nav id="daynav"></nav>
+    <div class="side-foot">
+      <a href="#/map" class="side-link" data-route="map"><span>🗺️</span> 模型全景图</a>
+      <a href="#/playground" class="side-link" data-route="playground"><span>🧪</span> Playground</a>
+      <button id="theme-toggle" class="side-link" type="button"><span>🌗</span> 切换明暗</button>
+    </div>
+  </aside>
+  <main id="main"><div class="loading">加载中…</div></main>
+</div>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-head">
+    <div><b id="drawer-title"></b> <a id="drawer-vscode" class="muted" href="#">在 VS Code 中打开 ↗</a></div>
+    <button id="drawer-close" class="btn ghost" type="button">关闭 ✕</button>
+  </div>
+  <div id="drawer-body" class="drawer-body"></div>
+</div>
+<div id="inspector" class="inspector" hidden></div>
+<div id="tooltip" class="tooltip" hidden></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

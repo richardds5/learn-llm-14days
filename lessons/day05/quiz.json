@@ -1,0 +1,268 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "`MiniMindConfig(hidden_size=512)`（其余一律默认），这一层 `FeedForward` 里 `down_proj.weight` 的 shape 是？",
+    "options": [
+      "`[512, 1664]`",
+      "`[1664, 512]`",
+      "`[512, 2432]`",
+      "`[1664, 1664]`"
+    ],
+    "answer": [0],
+    "explain": "两步。① `intermediate_size = ceil(512·π/64)·64 = 26×64 = 1664`（Day 2 推过这条公式，实测 `MiniMindConfig(hidden_size=512).intermediate_size` 就是 1664）。② `down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)`，而 `nn.Linear.weight` 的形状是 `[out_features, in_features]`，所以是 `[512, 1664]`。选项 B 是 `gate_proj` / `up_proj` 的形状——这三个矩阵里只有 `down_proj` 的方向是反的，也是抄这段代码时最常写错的地方。选项 C 用的是 `hidden_size=768` 时的 `I = 2432`。把实验里的 `build_model()` 改成 `build_model(hidden_size=512)` 就能在表格里直接看到这三行。",
+    "ref": "model/model_minimind.py#L140-L142"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "实验里 `act_fn(gate_proj(x))` 那一行的统计量，下面哪个说法对得上？",
+    "options": [
+      "约 36% 的值恰好等于 0，这些通道被彻底关掉了",
+      "最小值停在 `-0.2785`，而「恰好 = 0」的比例是 `0.00%`",
+      "输出全部非负，负半轴被激活函数切掉了",
+      "分布和 `up_proj(x)` 基本一致，因为两个矩阵形状完全相同"
+    ],
+    "answer": [1],
+    "explain": "表格第一行：最小值 `-0.2785`、恰好 = 0 占 `0.00%`、小于 0 的占 36.0%。`SiLU(x) = x·sigmoid(x)` 有一个全局下界 `-0.2784645`（在 `x ≈ -1.2785` 处取到），除 `x = 0` 这一点外永远不等于 0——选项 A 把「36% 为负」错记成了「36% 恰好为 0」，选项 C 描述的是 ReLU 的行为。选项 D 也不对：第二行的 `up_proj(x)` 是纯线性输出，近似对称（49.7% 为负、最小值 -3.33），没有被压向 0 的形状。想看硬门控长什么样，把 `act_fn` 换成 `torch.relu` 再跑，「恰好 = 0」那一格会变成 35.96%。",
+    "ref": "model/model_minimind.py#L143"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "把 `intermediate_size` 显式设成 2048（`hidden_size` 仍是 768），一层 FFN 的参数量和「两矩阵、中间维 `4C`」的经典 MLP 相比？",
+    "options": [
+      "FFN 仍然多 18.75%，因为 SwiGLU 天生多一个矩阵",
+      "FFN 少 25%",
+      "FFN 多 33%",
+      "两者正好相等"
+    ],
+    "answer": [3],
+    "explain": "`3·C·I = 3×768×2048 = 4,718,592`，而 `2·C·4C = 2×768×3072 = 4,718,592`——比值正好 1.0000（把实验里的 `build_model()` 改成 `build_model(intermediate_size=2048)`，最后一行就会变成 1.0000）。`2048` 正是 `3·C·I = 8C²` 的解 `I = 8C/3`，LLaMA 系那个 `8/3` 系数的设计目标本来就是「换成 SwiGLU 但总参数量不变」。选项 A 是 MiniMind 默认 `I = 2432` 时的结论，那 18.75% 来自把系数从 `8/3` 换成了 `π`（`π / (8/3) ≈ 1.178`）。",
+    "ref": "model/model_minimind.py#L26"
+  },
+  {
+    "id": "q4",
+    "type": "multi",
+    "question": "下面哪些说法和 `MiniMindBlock.forward` 的源码一致？（多选）",
+    "options": [
+      "`input_layernorm` 归一化的是喂给 `self_attn` 的那份副本，而加回去的 `residual` 是没归一化的原值",
+      "L193 右边那个 `hidden_states` 同时充当两个角色：`post_attention_layernorm` 的输入，和第二组残差的 residual",
+      "`present_key_value` 是 Block 自己构造出来的，再逐层往上传",
+      "每层用的 `position_embeddings` 是 `MiniMindModel.forward` 算好后原样传进来的，L 层共用同一对 `cos/sin`"
+    ],
+    "answer": [0, 1, 3],
+    "explain": "A 就是 L187 + L189：`residual = hidden_states` 存的是原值，进 `self_attn` 的是 `self.input_layernorm(hidden_states)` 这份临时副本——这正是 Day 2 里残差流范数单调增长（1.3 → 36）的原因。B 就是 L193 那句紧凑写法的含义，逐行追踪里也能看到这一行读了两次同一个变量。D 见 `MiniMindModel.forward`：`position_embeddings` 在循环外切一次，循环里原样传给每一层。C **错**：L188 的 `present_key_value` 是 `self.self_attn(...)` 的第二个返回值，Block 只是原样透传，真正产生 `(xk, xv)` 的是 `Attention.forward`（Day 4 讲过，Day 7 会用到）。",
+    "ref": "model/model_minimind.py#L186-L194"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "把 `MiniMindBlock.forward` 里两处残差相加分别改成 in-place，再跑 `loss.backward()`。下面哪种结果和实测一致？",
+    "options": [
+      "三种写法都能正常 backward——`+=` 和 `=` 在 autograd 眼里本来就等价",
+      "只要出现 `+=` 就会报错，所以源码原样那一行（L192 的 `+=`）本身就该报错",
+      "源码原样、以及「两处都不 in-place」都正常，只有「L193 也改成 `+=`」那一种在 backward 时抛 `RuntimeError`",
+      "三种写法都不报错，但 in-place 的那两种会算出不一样的梯度"
+    ],
+    "answer": [2],
+    "explain": "实验的三行：前两行「backward 正常跑完」，第三行 `RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation`。区别在于**这个张量此刻有没有被某个算子存起来供反向使用**：L192 改的是 `self_attn` 刚返回的新张量，还没人存过它；L193 的 `hidden_states` 则已经被 `post_attention_layernorm` 存了下来（RMSNorm 的反向要用输入本身算梯度，见 `model_minimind.py:56-60`）。PyTorch 用张量的 `_version` 计数器发现这件事，宁可报错也不默默算错——选项 D 描述的「悄悄算出不同的梯度」正是它极力避免的情况。",
+    "ref": "model/model_minimind.py#L192-L193"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "实验第二行显示：把 L192 也改成非 in-place 的 `hidden_states = hidden_states + residual`，backward 照样正常。那源码为什么偏要在这里写 `+=`？",
+    "options": [
+      "因为 `residual` 是叶子节点，只有对叶子节点才允许 in-place",
+      "因为 attention 的输出不参与反向传播，这个张量怎么改都无所谓",
+      "纯粹为了省一次 `[B,T,C]` 的内存分配——此刻这个张量还没被任何算子存起来做反向，所以原地改是安全的",
+      "因为 in-place 会让 autograd 少记录一个节点，梯度数值更稳定"
+    ],
+    "answer": [2],
+    "explain": "第二行证明两种写法在正确性上完全等价，所以 `+=` 的唯一好处就是少分配一个 `[B,T,C]` 的新张量（长序列 + 大 batch 下这是实打实的显存）。它之所以安全，靠的是时机：L192 改的是 `self_attn` 刚返回的新张量，此刻还没有任何算子把它保存下来供反向使用；而 L193 的 `hidden_states` 已经被 `post_attention_layernorm` 存了。选项 B 明显错——attention 的输出当然参与反向。选项 D 也错：in-place 从不改变梯度数值，它要么什么都不影响，要么直接让 `backward()` 报错。",
+    "ref": "model/model_minimind.py#L192"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "默认的 `logits_to_keep=0`，`T=7`。`hidden_states[:, slice_indices, :]` 会留下几个位置？",
+    "options": [
+      "0 个：`slice(-0, None)` 是一个空切片，所以默认不返回 logits",
+      "1 个：0 被当成「不指定」，退化成只留最后一个位置",
+      "报错：`slice(-0, None)` 不是合法的切片",
+      "7 个（全部）：`-0 == 0`，所以 `slice(-0, None)` 其实就是 `slice(0, None)`"
+    ],
+    "answer": [3],
+    "explain": "实验表格第一行把 `slice_indices` 直接打印了出来：`slice(0, None, None)`，对应的 `logits.shape` 是 `[3, 7, 6400]`。Python 里整数 `0` 取负还是 `0`（`-0 == 0` 为 `True`），于是「最后 0 个」被意外地写成了「从第 0 个到结尾」= 全部位置。这个巧合正是默认值敢写 `0` 的原因：训练时 `model(input_ids, labels=labels)` 什么都不用传就能拿到完整的 `[B, T, V]` 去和 labels 对齐。反过来说，真想只要最后一个位置，必须显式传 `1`。",
+    "ref": "model/model_minimind.py#L247"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`model(input_ids, logits_to_keep=-3)`（`T=7`）会切出几个位置？",
+    "options": [
+      "报错：`logits_to_keep` 不接受负数",
+      "4 个：`slice(-(-3), None)` 就是 `slice(3, None)`，从第 3 个位置一直到结尾",
+      "3 个，和 `logits_to_keep=3` 完全一样",
+      "0 个，得到一个空张量"
+    ],
+    "answer": [1],
+    "explain": "那一行没有任何范围检查，只是机械地把 `logits_to_keep` 取负号塞进 `slice`：`slice(-(-3), None)` = `slice(3, None)`，`T=7` 时留下位置 3、4、5、6 共 **4** 个，实测 `logits.shape = [3, 4, 6400]`。选项 C 是最常见的直觉错误（以为负号会被「吸收」掉）。想精确指定「倒数第 3 个」这一个位置，得走另一支：传 `torch.tensor([-3])`，`isinstance(..., int)` 为 `False`，走花式索引，实测得到 `[3, 1, 6400]`。",
+    "ref": "model/model_minimind.py#L247"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "把 `logits_to_keep` 从 0 改成 1，下面哪一项基本不变？",
+    "options": [
+      "`lm_head` 那次矩阵乘的 FLOPs",
+      "`logits` 张量占的显存",
+      "L 层 attention + FFN 的计算量",
+      "`logits.shape[1]`"
+    ],
+    "answer": [2],
+    "explain": "实验把 forward 拆成两段分别计时（`B=3, T=300`）：8 层主体约 120 ms，`lm_head` 全量约 6 ms、只留最后一个不到 1 ms——`lm_head` 只占总耗时的百分之几。`logits_to_keep` 出现在 `self.model(...)` 跑完**之后**（L247 在 L246 后面），根本够不着主体；而且主体也不能少算——attention 里后面的位置要读前面所有位置的 key/value。A、B、D 三项都正比于切出来的位置数 `n`：FLOPs 从 `2·B·T·C·V` 降到 `2·B·1·C·V`，显存从 21.97 MB 降到 0.07 MB，`shape[1]` 从 300 降到 1。",
+    "ref": "model/model_minimind.py#L246-L248"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "一条 `T=6` 的序列（第 0 位是 BOS），`labels = input_ids.clone()`。一共产生几项 loss？`logits[3]` 的监督目标是谁？",
+    "options": [
+      "6 项；`labels[3]`",
+      "5 项；`labels[4]`",
+      "6 项；`labels[4]`",
+      "5 项；`labels[2]`"
+    ],
+    "answer": [1],
+    "explain": "`x = logits[..., :-1, :]` 留下位置 0~4（5 个），`y = labels[..., 1:]` 留下位置 1~5（5 个），两者逐位相对，于是 `logits[t]` 对 `labels[t+1]`，`logits[3]` 对的是 `labels[4]`。实验表格 `t=3` 那一行正是这个：输入是 `'喜欢'`，top-1 是 `'吃'`，而监督目标 `labels[4]` 也是 `'吃'`。`T` 个位置只有 `T-1` 项 loss：`logits[5]` 没有「下一个 token」可预测，`labels[0]`（BOS）也没有任何 logits 负责预测它——两头各少一个，但少的是**不同的一端**。",
+    "ref": "model/model_minimind.py#L251"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "把源码 L251 里两个 `.contiguous()` 都删掉（`B=3, T=7`），最先发生什么？",
+    "options": [
+      "没有任何影响，`view` 对任何张量都能用",
+      "forward 正常跑完，但 loss 的数值会算错",
+      "在 `x.view(-1, x.size(-1))` 那一步抛 `RuntimeError`，提示 size 和 stride 不兼容",
+      "只有 `labels` 那一侧会报错，`logits` 那一侧没问题"
+    ],
+    "answer": [2],
+    "explain": "实验表格第 2 行：`logits[..., :-1, :].is_contiguous()` 是 `False`，`view` 直接抛 `view size is not compatible with input tensor's size and stride`。两侧其实**都**不连续（第 5 行的 `labels[..., 1:]` 同样是 `False`、同样报错），只不过 `x.view(...)` 是先被求值的那个，所以先炸的是它——选项 D 说反了。改成 `.reshape` 就不会报错（第 4 行），因为它在需要时会自己拷一份连续内存。一个容易忽略的边界情况：`B=1` 时 `[1, T-1, V]` 反而是连续的，这个坑只在 `B > 1` 时暴露。",
+    "ref": "model/model_minimind.py#L251-L252"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "一个 batch 里**所有**位置的 `labels` 都是 `-100`（有效位置数 = 0），`model(input_ids, labels=labels).loss` 是什么？",
+    "options": [
+      "`nan`：`mean` reduction 算的是 `sum / count`，`0 / 0` 得到 `nan`，而且全程不抛异常",
+      "`0.0`：没有任何位置贡献 loss，累加结果自然是 0",
+      "`None`：`cross_entropy` 检测到没有有效样本，干脆不返回",
+      "抛 `RuntimeError`，提示所有 target 都被 ignore 了"
+    ],
+    "answer": [0],
+    "explain": "实验最后一行：有效位置 `0 / 18`，loss 是 `nan`。`ignore_index` 把这些位置从**分子和分母**里同时剔除，分母归零之后 `mean` 就是 `0/0`。危险之处在于它一声不吭：`forward` 正常返回，`backward()` 照常执行，然后把整个模型的梯度污染成 `nan`，往往要到几步之后才发现 loss 不动了。所以 SFT / DPO 这类会整段 mask 掉 prompt 的 Dataset，必须保证每条样本至少留一个有效位置。",
+    "ref": "model/model_minimind.py#L252"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "一个 batch 有 4 条样本，其中 1 条的 `labels` 被整条设成 `-100`，其余 3 条正常。这一步的 loss 会怎样？",
+    "options": [
+      "变成 `nan`，因为有一条样本的有效位置数是 0",
+      "正常的有限值：那条样本的位置既不进分子也不进分母，相当于这个 batch 只有 3 条样本",
+      "正常，但那条样本会贡献 `T-1` 个 0，把整体 loss 拉低约 25%",
+      "抛 `ValueError`：`cross_entropy` 不接受整行被 mask 的样本"
+    ],
+    "answer": [1],
+    "explain": "`cross_entropy` 是先把 `[B, T-1]` 拍成一维再算的，它根本不知道「样本」的边界，只数有多少个 label ≠ `-100`。实验第 3 行就是这个情形：有效位置从 18 降到 12，loss 是 8.6926（在剩下 12 个位置上平均），完全正常。选项 C 描述的是「贡献一个 0」的误解——真是那样的话 loss 会变成表格最后一列的 5.7951。只有当**整个 batch** 的有效位置数掉到 0（实验最后一行）才会出现 `nan`。",
+    "ref": "model/model_minimind.py#L252"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "`per = F.cross_entropy(..., reduction='none')` 得到 `[B·(T-1)]`。`per[0]` 表示什么？",
+    "options": [
+      "第 0 个 token 自身的 loss",
+      "整条序列的平均 loss",
+      "BOS 位置被 `ignore_index` 跳过了，所以 `per[0]` 恒为 0",
+      "「看过 `toks[0]`（BOS）之后，预测 `toks[1]` 有多意外」"
+    ],
+    "answer": [3],
+    "explain": "shift 之后 `per[t]` 对应的是 `x[t] = logits[t]` 和 `y[t] = labels[t+1]` 这一对，所以 `per[0]` 是「在 BOS 这个位置上预测第 1 个真实 token」的 `-log p`。实验里这一格是 7.04（`'今天'`），是全句最贵的一格——它前面除了 BOS 没有任何上文。这也是画彩带时必须把 `per` 标在 `toks[1:]` 上的原因：标在 `toks` 上整张图会偏一位。选项 C 错在 BOS 是个合法 token（`id=1`，不是 `-100`），它照常参与 loss。",
+    "ref": "model/model_minimind.py#L252"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "对中间层的 `hidden_states` 直接套用 `model.model.norm + lm_head`，也能读出还算合理的 top-1。最主要的原因是？",
+    "options": [
+      "每个 `MiniMindBlock` 内部都额外调用过一次 `lm_head` 做辅助监督",
+      "残差流「只加不替换」，中间层和最终层活在同一个坐标系里，同一份 `lm_head` 权重对它们都部分适用",
+      "`lm_head` 的权重和每一层的 `mlp.down_proj` 是共享的",
+      "纯属巧合：中间层的 `hidden_states` 和最后一层在数值上几乎相同"
+    ],
+    "answer": [1],
+    "explain": "`MiniMindBlock.forward` 每层都是 `hidden_states = hidden_states + 子层输出`（L192、L193），从不整体替换，所以任何一层的 `hidden_states` 都和最终层处在同一个表示空间里。选项 D 明显不成立——实验里 `‖hidden_states‖` 从 7.2 一路涨到 52.0，而且 layer0 的 top-1 是 `'吃'`、layer7 才是 `'鱼'`，差别很大。选项 A、C 在源码里都不存在：`lm_head` 只在 `MiniMindForCausalLM.forward` 里出现一次，它的权重是和 `embed_tokens` 共享的（Day 2 的 weight tying），和 `down_proj` 无关。",
+    "ref": "model/model_minimind.py#L192-L193"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`generate()` 配合 KV cache 做自回归解码，从第二步起送进 `forward` 的 `input_ids` 只有 1 个 token。此时传 `logits_to_keep=1` 和用默认的 `0`，区别是？",
+    "options": [
+      "没有区别：`T=1` 时 `slice(0, None)` 和 `slice(-1, None)` 切出来的是同一个位置",
+      "`logits_to_keep=1` 会快 `T` 倍",
+      "默认的 `0` 会返回空张量，所以必须传 1",
+      "`logits_to_keep=1` 会报错，因为序列里只有一个位置"
+    ],
+    "answer": [0],
+    "explain": "`T=1` 时 `slice(0, None)` 和 `slice(-1, None)` 落在同一个位置上，两种传法的 `logits` 都是 `[B, 1, V]`（实测确认）。所以 `logits_to_keep` 在解码循环的主体里其实没什么可省的——真正被浪费的是 **prefill**：第一次调用送进去的是整段 prompt，而 `generate()` 只用 `outputs.logits[:, -1, :]`（`model_minimind.py:268`），等于把 `[B, prompt_len, V]` 白物化了一遍。顺带一提，`generate()` 自己没有传 `logits_to_keep`；但全仓 grep 能找到 `trainer/rollout_engine.py:29` 的 `compute_per_token_logps` 确实传了 `logits_to_keep=n_keep + 1`（Day 12 GRPO/PPO 的 rollout 阶段），只算需要的那几个位置——这个参数不是摆设，只是预训练/推理这条路径没用上它。",
+    "ref": "model/model_minimind.py#L247"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`use_moe=False` 的模型跑 `model(input_ids, logits_to_keep=1)`，返回的 `MoeCausalLMOutputWithPast` 里，`aux_loss` 和 `hidden_states` 分别是什么？",
+    "options": [
+      "`aux_loss=None`；`hidden_states` 是 `[B, 1, C]`",
+      "`aux_loss` 是标量 `0.0`；`hidden_states` 是 `[B, T, C]`",
+      "`aux_loss` 是标量 `0.0`；`hidden_states` 是 `[B, 1, C]`",
+      "没有 `aux_loss` 这个字段，`use_moe=False` 时它被省略了"
+    ],
+    "answer": [1],
+    "explain": "`MiniMindModel.forward` 里 `aux_loss = sum([...], hidden_states.new_zeros(1).squeeze())`：没有任何 `MOEFeedForward` 时列表为空，`sum` 返回的就是那个 0 维初值 `tensor(0.)`——是标量 0，不是 `None`（Day 6 讲 MoE 路由损失时它才会非零）。`hidden_states` 字段装的是 `self.model(...)` 返回的那一份，**在 `slice_indices` 切片之前**，所以永远是完整的 `[B, T, C]`；被 `logits_to_keep` 削短的只有 `logits`。实测 `logits` 是 `[3, 1, 6400]` 而 `hidden_states` 是 `[3, 7, 768]`。",
+    "ref": "model/model_minimind.py#L231-L253"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "默认配置（C=768, I=2432, V=6400），`B=3, T=7` 跑一次 `model(input_ids, labels=labels)`。下面哪条 shape 链是对的？",
+    "options": [
+      "`[3,7,768]` →（FFN 中间）`[3,7,2432]` → `[3,7,768]` →（lm_head）`[3,7,6400]` →（shift + 拍平）`[18,6400]` → 标量",
+      "`[3,7,768]` → `[3,7,2432]` → `[3,7,6400]` → `[21,6400]` → 标量",
+      "`[3,7,768]` → `[3,7,768]` → `[3,7,6400]` → `[21,6400]` → 标量",
+      "`[3,7,768]` → `[3,7,2432]` → `[3,7,768]` → `[3,7,6400]` → `[21,6400]` → 标量"
+    ],
+    "answer": [0],
+    "explain": "两个判别点。① FFN 内部会短暂撑到 `[B,T,I] = [3,7,2432]`，但 `down_proj` 必须把它压回 `[3,7,768]`，否则下一步的残差相加加不上——选项 B 漏了压回这一步。② 拍平之后的第一维是 `B·(T-1) = 3×6 = **18**`，不是 `B·T = 21`：shift 已经吃掉了一个位置（选项 C、D 的错处）。注意 `logits` 本身仍是完整的 `[3,7,6400]`，被切掉一位的是参与 loss 的那个 `x`。",
+    "ref": "model/model_minimind.py#L146-L252"
+  },
+  {
+    "id": "q16",
+    "type": "multi",
+    "question": "下面哪些改动会让某一步训练直接失败（抛异常或产生 `nan`）？（多选）",
+    "options": [
+      "把 `MiniMindBlock` 的 L193 改成 `hidden_states += self.mlp(self.post_attention_layernorm(hidden_states))`",
+      "一个 batch 里所有位置的 `labels` 都是 `-100`",
+      "把 `ignore_index=-100` 改成 `ignore_index=-1`，而 `labels` 里仍然填的是 `-100`",
+      "把 `x.view(-1, x.size(-1))` 换成 `x.reshape(-1, x.size(-1))`"
+    ],
+    "answer": [0, 1, 2],
+    "explain": "A：`post_attention_layernorm` 把它的输入存下来做反向，紧接着的 in-place 撞上 `_version` 检查，`backward()` 抛 `RuntimeError`（forward 阶段不报错，这一点很坑）。B：有效位置数为 0，`mean` 算 `0/0` 得到 `nan`，同样不报错，但会污染全部梯度。C：`-100` 不再被当成「忽略」，而是被当成一个合法的类别下标送进 `cross_entropy`，实测抛 `IndexError: Target -100 is out of bounds.`。D **不会**失败：`reshape` 是 `view` 的宽松版，遇到不连续的张量会自己拷一份连续内存，结果完全相同——源码里那两个 `.contiguous()` 正是为了让 `view` 能用，换成 `reshape` 连 `.contiguous()` 都可以省掉。",
+    "ref": "model/model_minimind.py#L193-L252"
+  }
+]

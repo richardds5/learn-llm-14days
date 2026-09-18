@@ -1,0 +1,310 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "把实验里 `generate(..., use_cache=True)` 改成 `use_cache=False`，其余不动。从第 1 步开始，`past_len` 那一列会是什么？",
+    "options": [
+      "恒为 0——L281 `past_key_values = outputs.past_key_values if use_cache else None` 每步把它设回 `None`，而 `past_len = ... if past_key_values else 0` 里 `None` 是 falsy，于是每步都从头喂一遍完整序列",
+      "等于上一步的总长度，只是拿到的 K/V 不再复用，要重算一遍",
+      "恒等于 prompt 长度，新生成的 token 不会再被喂回模型",
+      "会抛异常：`forward` 在 `use_cache=False` 时不接受非 `None` 的 `past_key_values`"
+    ],
+    "answer": [0],
+    "explain": "实测把这一行改掉之后表格变成 `(3,11) past_len=0` / `(3,12) past_len=0` / `(3,13) past_len=0` …：`past_len` 恒为 0，「这一步喂进 forward 的 input_ids」那一列反而每步长 1。原因是 L281 把 `past_key_values` 设回了 `None`，L264 的 `if past_key_values` 判定为假。结果依然正确（因果 mask 保证重算得到同样的值），只是把全部历史的 K/V 又算了一遍——这正是 [关掉 cache 之后多算了多少](#kv-win) 那一节要量的东西。",
+    "ref": "model/model_minimind.py#L264"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "把实验里的 `build_model(num_hidden_layers=2)` 改成 `num_hidden_layers=3`（`max_new_tokens` 仍是 5）。表格会有几行？如果换成 `trace(model, fns=[Attention.forward])` 去数，`Attention.forward` 又被调用几次？",
+    "options": [
+      "表格 5 行；`Attention.forward` 15 次",
+      "表格 15 行；`Attention.forward` 15 次",
+      "表格 5 行；`Attention.forward` 5 次",
+      "表格 3 行；`Attention.forward` 15 次"
+    ],
+    "answer": [0],
+    "explain": "实验的 hook 挂在 `model.model`（`MiniMindModel`）上，而 `MiniMindModel.forward` 每个 generate 步只被调用一次，所以表格永远是 `max_new_tokens` 行、和层数无关——这也是实验选它当观察点的原因。`Attention.forward` 则是每层每步各一次：trace 用函数的 `__code__` 对象当 key，3 层共享同一份代码，所以计数器是 3×5=15。实测确实是 `hook 行数 = 5`、`total_calls = 15`。",
+    "ref": "model/model_minimind.py#L263"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`eval_llm.py` 调 generate 时明明传了 `pad_token_id=tokenizer.pad_token_id`（这个 tokenizer 里 pad 是 0、eos 是 2），为什么已完成那一行的结尾填的仍然是 2？",
+    "options": [
+      "因为这个 tokenizer 里 `pad_token_id` 和 `eos_token_id` 实际上是同一个 token",
+      "只有 `attention_mask` 为 `None` 时才用 eos 填，传了 mask 就会改用 pad",
+      "`torch.where` 会在 pad 和 eos 里自动挑数值较大的那个",
+      "`generate` 的签名里根本没有 `pad_token_id` 这个形参：它落进 `**kwargs`，被一路带给 `self.forward` 再带给 `MiniMindModel.forward`，最后被忽略；填空用的写死是 `eos_token_id`"
+    ],
+    "answer": [3],
+    "explain": "看 L257 的签名：`generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=..., top_p=..., top_k=..., eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs)` —— 没有 `pad_token_id`。它进了 `**kwargs`，然后随 L265 的 `self.forward(..., **kwargs)` 一路下传，`MiniMindModel.forward` 的 `**kwargs` 把它吃掉，谁也没用它。L279 的 `next_token.new_full((next_token.shape[0], 1), eos_token_id)` 写死了用 eos 填。这是 MiniMind 自写 generate 和 HF `GenerationMixin` 的一处行为差异：HF 会真的用 pad。",
+    "ref": "model/model_minimind.py#L257"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "batch 里有 2 个 prompt（行 0、行 1），`num_return_sequences=3`。想拿到「行 1 这个 prompt 的 3 个采样结果」，该取 repeat 之后的哪几行？",
+    "options": [
+      "第 3、4、5 行（后半整块）",
+      "第 1、3、5 行——`.repeat(3, 1)` 是把整个 `[2, T]` 张量沿 dim0 首尾接 3 遍，所以步长等于原始 batch size 2",
+      "第 0、1 行",
+      "取决于 tokenizer 的 padding 方向，无法一概而论"
+    ],
+    "answer": [1],
+    "explain": "`Tensor.repeat(3, 1)` 是 tile：`[p0, p1]` → `[p0, p1, p0, p1, p0, p1]`，而不是 `[p0, p0, p0, p1, p1, p1]`（后者是 `repeat_interleave(3, dim=0)` 的语义，实验的第 4、5 列就是对照）。所以 prompt1 的三份候选在第 1、3、5 行，通项是 `i, i+B, i+2B`。取错行是静默错误：shape 对、内容也像模像样，只是候选配错了 prompt。",
+    "ref": "model/model_minimind.py#L258"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "默认配置（`H=8, KV=4, D=96`），`B=3`，prefill 完 11 个 token 之后，`past_key_values[0][0]` 的 shape 是？",
+    "options": [
+      "`[3, 11, 8, 96]`——cache 按 query 头数存，这样算 attention 时不用再 repeat",
+      "`[3, 8, 11, 96]`——存的是 `repeat_kv` + `transpose(1,2)` 之后、直接能进矩阵乘的形态",
+      "`[3, 11, 4, 96]`——L123 `past_kv = (xk, xv)` 在 L124 的 `repeat_kv` 之前，所以按 KV 头数存、T 维在第 1 位",
+      "`[3, 4, 11, 96]`"
+    ],
+    "answer": [2],
+    "explain": "trace 里 L123 那一行写出的 `past_kv` 是 `tuple([B=3, T=11, KV=4, D=96], [B=3, T=11, KV=4, D=96])`，而 L124 之后 `xk` 才变成 `[B=3, H=8, T=11, D=96]`。两行的先后顺序决定了 cache 的体积：按 `KV=4` 存只有按 `H=8` 存的一半，`repeat_kv` 撑出来的那份只在这一次 attention 里活着，算完就扔。另外 T 维在第 1 位（不是第 2 位），所以 L121 的 `torch.cat(..., dim=1)` 和 L213 的 `shape[1]` 才对得上。",
+    "ref": "model/model_minimind.py#L123"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "`flash_attn=True` 的默认配置下，decode 阶段（`seq_len=1`、有 cache）为什么必然走 L128 开始的手写 attention 分支？",
+    "options": [
+      "因为 `self.flash` 在检测到 `past_key_value` 之后会被置成 `False`",
+      "因为 `attention_mask` 里一定出现了 0",
+      "不一定：只要 `flash_attn=True`，decode 照样走 `F.scaled_dot_product_attention`",
+      "L125 的条件里有两项同时不成立：`seq_len > 1` 为假，`(not self.is_causal or past_key_value is None)` 也为假（`is_causal=True` 且 cache 非 None），任意一项都足以把它挡下来"
+    ],
+    "answer": [3],
+    "explain": "L125 的完整条件是 `self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1))`。decode 时 `seq_len` 恒为 1，第二项直接为假；同时 `is_causal` 在 L99 写死是 `True`、`past_key_value` 非 `None`，第三项也为假。trace 里对比两次调用执行过的行就能看到：prefill 走了 125→126，decode 走的是 125→128→129→130→131。顺带一提，decode 时 L129 的因果掩码 `torch.full((1,1), -inf).triu(1)` 退化成一个全 0 的 `[1,1]`，等于没加——这是对的，新 token 本来就能看见全部历史。",
+    "ref": "model/model_minimind.py#L125"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "把 L219 的 `self.freqs_cos[start_pos:start_pos + seq_length]` 改写成 `self.freqs_cos[:seq_length]`（其余不动），会发生什么？",
+    "options": [
+      "没有影响。RoPE 是相对位置编码，只看 token 之间的距离，整体平移不改变结果",
+      "prefill 阶段没事（那时 `start_pos` 本来就是 0）；decode 阶段每个新 token 都会被按「位置 0」旋转，而 cache 里的 K 是按真实位置转过的，两者的相对距离全错——不报错，只是开始胡说",
+      "会立刻抛 shape 不匹配：`cos` 的第 0 维和 `xk` 的 T 维对不上",
+      "只有 `use_cache=False` 时才有影响"
+    ],
+    "answer": [1],
+    "explain": "decode 时 `seq_length=1`，`freqs_cos[:1]` 和 `freqs_cos[start_pos:start_pos+1]` 的 shape 都是 `[1, 96]`，所以不会报 shape 错（排除选项 C）。RoPE 的内积确实只取决于相对距离，但前提是 q 和 k 用的是**同一套**绝对位置；cache 里的 K 已经按真实位置 0…start_pos-1 转过了，新来的 q 如果回到位置 0，相对距离就全部错位（排除选项 A）。`use_cache=False` 时 `start_pos` 本来就恒为 0、喂的又是整段序列，改与不改一个样（排除选项 D）。实验里三次调用的 `start_pos` 是 0 / 11 / 12，正好对上每一步新 token 的真实位置。",
+    "ref": "model/model_minimind.py#L219"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "把实验里的 `N_NEW` 从 64 改成 16（prompt 仍是 22 个 token），「送进 embed 的 token 总数」那一行的比值会变成多少？",
+    "options": [
+      "还是 40 倍左右——这个比值只跟 prompt 长度有关",
+      "约 12.8 倍：有 cache 是 `22 + 15 = 37`，无 cache 是 `16×22 + 16×15/2 = 472`",
+      "约 4 倍",
+      "约 64 倍，比 N=64 时还大"
+    ],
+    "answer": [1],
+    "explain": "有 cache：prefill 喂 P 个、之后 N−1 步各 1 个，共 `P + (N-1) = 37`。无 cache：第 k 步喂 `P+k` 个，共 `N·P + N(N-1)/2 = 352 + 120 = 472`。472/37 ≈ 12.8。可以看出比值大致随 N 线性增长（N=64 时是 3424/85 ≈ 40.3），所以生成得越长，KV cache 省掉的重复计算越多——反过来，只生成十几个 token 时 cache 的价值就没那么夸张。",
+    "ref": "model/model_minimind.py#L264"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "把 `temperature` 从 1.0 改成 0.5，其余参数不变。`top_k=3` 选出来的那 3 个词会变吗？`top_p=0.85` 留下的候选数会变吗？",
+    "options": [
+      "两个都不会变：temperature 只是等比缩放，不改变任何截断结果",
+      "top-k 选出的词会变，top-p 留下的数量不变",
+      "top-k 选出的 3 个词不变（除以正数是单调变换，名次不动），但 top-p 留下的候选数会变——实测从 2 个降到 1 个",
+      "两个都会变"
+    ],
+    "answer": [2],
+    "explain": "`logits / τ`（τ>0）是单调递增变换，任何两个 logit 的大小关系都不变，所以按**名次**截断的 top-k 完全不受影响。而 top-p 按 `softmax` 之后的**累计概率**截断：τ 变小分布变尖，头部几个词很快就凑够 `top_p`，核变小。实测同一条分布上 `top_p=0.85` 留下的候选数是 τ=0.5 → 1 个、τ=1.0 → 2 个、τ=2.0 → 993 个。所以调 temperature 时实际上也在悄悄改变 top-p 的有效强度。",
+    "ref": "model/model_minimind.py#L267"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "`logits` 是 `[B, V]`。`torch.topk(logits, top_k)[0][..., -1, None]` 这一串算出来的 shape 和含义是？",
+    "options": [
+      "`[B, k]`，最大的 k 个值本身",
+      "`[B, V]`，已经广播好的阈值矩阵",
+      "`[1, B]`，转置之后的阈值向量",
+      "`[B, 1]`，每一行第 `top_k` 大的那个值——`[0]` 取 values，`-1` 取降序排列的最后一个（即第 k 大），`None` 补回一个长度 1 的维度以便和 `[B, V]` 广播比较"
+    ],
+    "answer": [3],
+    "explain": "`torch.topk` 返回 `(values, indices)`，`[0]` 拿到 `[B, k]` 的 values（已按降序）。`[..., -1]` 取每行最后一个 = 第 k 大的那个值，shape 变成 `[B]`；紧跟的 `None` 等价于 `unsqueeze(-1)`，补成 `[B, 1]`。这样 `logits < 阈值` 才能广播成 `[B, V]` 的布尔 mask 去做索引赋值。注意比较用的是 `<` 而不是 `<=`，所以并列第 k 名会一起留下，实际候选数可能略多于 k。",
+    "ref": "model/model_minimind.py#L272"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "用 generate 的默认参数（`top_k=50`, `top_p=0.85`）处理一条 top1 概率 0.752、第 2 名 0.178 的尖锐分布。最终有几个 token 的概率不是 0？",
+    "options": [
+      "50 个：top-k 先执行，top-p 只能在它留下的 50 个里挑，砍不动",
+      "2 个：top-k 先把 6400 个砍到 50 个，top-p 再在这 50 个里按概率质量砍到 2 个（0.752+0.178=0.930 就已经越过 0.85）",
+      "6400 个：两者只改概率、不改候选总数",
+      "52 个"
+    ],
+    "answer": [1],
+    "explain": "两步是串行叠加的：L271-L272 先把除前 50 名之外的位置全置 `-inf`（softmax 后概率为 0，不再占 top-p 的概率预算），L273-L277 再在剩下的 50 个里累加概率、越过 `top_p` 就截断。实测这条分布 top-k 之后是 50 个候选，再过 top-p 之后只剩 2 个。所以「先 k 后 p」的实际语义是：**top-k 定上限，top-p 定实际值**——在尖锐分布上真正起作用的是 top-p。",
+    "ref": "model/model_minimind.py#L271-L277"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "把 `top_p` 改成 0.3（比最高的 `cat` 自己的 0.5 还小），同时去掉 `mask[..., 0] = 0` 这个保底（只做右移）。会发生什么？",
+    "options": [
+      "没有影响，`cumsum` 已经把顺序排好了",
+      "只影响并列最高概率的候选，`cat` 本身不受影响",
+      "`cat` 也会被判成要 mask，6 个词全部变 `-inf`，`softmax` 产出 `nan`，`multinomial` 抛 `RuntimeError: probability tensor contains either inf, nan or element < 0`",
+      "只有 `do_sample=False`（走 argmax）时才会出问题"
+    ],
+    "answer": [2],
+    "explain": "`cat` 在排序后第 0 位，它自己的 `cumsum` 就是 0.500 > 0.3，所以 `cumsum > top_p` 在位置 0 已经是 `True`。右移一位只改动位置 1 及以后（`mask[..., 1:] = mask[..., :-1]`），位置 0 保持原值 `True`；后面的词累计更大自然也全是 `True`，于是 6 个词一个不剩。实测候选数为 0、`softmax` 全是 `nan`、`multinomial` 直接抛 `RuntimeError`。`mask[..., 0] = 0` 就是专门保证「排序第一名永远不被 mask」，让 top-p 至少留 1 个候选。",
+    "ref": "model/model_minimind.py#L276"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`repetition_penalty=1.5`，某个已经出现过的 token 的 logit 是 `-2.0`。按 `torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)` 处理之后是多少？",
+    "options": [
+      "`-2.0 / 1.5 ≈ -1.33`（绝对值变小）",
+      "`-2.0 + 1.5 = -0.5`",
+      "`-2.0 × 1.5 = -3.0`，比原来更负，softmax 之后概率更低",
+      "保持 `-2.0` 不变，惩罚只对正 logit 生效"
+    ],
+    "answer": [2],
+    "explain": "`score = -2.0` 不满足 `score > 0`，走 `score * repetition_penalty` 分支，得到 `-3.0`。如果像选项 A 那样一律相除，负数除以大于 1 的数会往 0 靠，softmax 之后概率反而**升高**——实验里 `</think>`（logit −7.08）被一律相除处理后概率涨到 35.36 倍，而源码写法让它降到 0.10 倍。正 logit 两种写法结果相同（`+18.68 → +12.45`），错误只出现在负 logit 上，而且方向和意图完全相反。",
+    "ref": "model/model_minimind.py#L270"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "prompt 有 30 个 token，`max_new_tokens=10`，batch size 1，模型生成到第 4 个新 token 时采到 eos，`finished.all()` 成立、循环提前 break。`streamer.put` 一共被调用几次？第一次收到的 tensor 是什么 shape？",
+    "options": [
+      "11 次；第一次是 `[1, 30]`",
+      "5 次；第一次是 `[1, 30]`——L262 在进入循环前先把整个 prompt 推一次，之后每步推一个 `[1, 1]`",
+      "4 次；第一次是 `[1, 1]`",
+      "5 次；第一次是 `[1, 1]`"
+    ],
+    "answer": [1],
+    "explain": "`put` 的次数 = 1（L262 循环之前推整个 `input_ids`）+ 实际循环步数（L282 每步一次）= 1 + 4 = 5；`end()` 另算一次，不是 `put`。第一次的 shape 是 `[B, P] = [1, 30]`，之后每次都是 `[B, 1]`。实验里 prompt 22 个 token、`max_new_tokens=6`、没提前停，结果正是 7 次 put + 1 次 end。这个「第一次不一样」的形状是自己实现 streamer 时最容易踩的地方——`TextStreamer(skip_prompt=True)` 就是靠丢掉第一批来跳过 prompt 的。",
+    "ref": "model/model_minimind.py#L262"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "`eval_llm.py` 里 `args.weight` 含有 `'pretrain'`（比如加载 `pretrain_768.pth`）时，真正喂给 tokenizer 的文本是什么？",
+    "options": [
+      "和 full_sft 一样，走 `apply_chat_template(...)` 生成带 `<|im_start|>user …` 的对话文本",
+      "`tokenizer.bos_token + prompt`——把 prompt 当成一段连续文本的开头，让模型续写下去",
+      "原样的 `prompt`，不加任何特殊 token",
+      "`prompt + tokenizer.eos_token`"
+    ],
+    "answer": [1],
+    "explain": "L73-L74：`if 'pretrain' in args.weight: inputs = tokenizer.bos_token + prompt`。pretrain 权重的训练目标只有「续写下一个 token」，从没见过 `<|im_start|>user … <|im_start|>assistant` 这套结构，套 chat 模板等于喂一堆它不认识的特殊 token。实验里同一个「请用一句话介绍北京」，pretrain 续写出「的文化。北京是中国的首都，有着悠久的历史和丰富的文化遗产，如故宫、天坛、颐和园等。」——通顺，但它在接话；full_sft 才是在回答。注意判断依据是**权重文件名字符串**，不是模型结构，所以把 sft 权重改名成含 `pretrain` 也会走这条路。",
+    "ref": "eval_llm.py#L73-L76"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "MiniMind 默认配置（`L=8`, `num_key_value_heads=4`, `D=96`），`B=1`、`T=4096`、fp16。KV cache 占多少？如果改成 `num_key_value_heads=8`（等价 MHA）又是多少？",
+    "options": [
+      "48 MB / 96 MB：`2 × 8 × 1 × 4096 × 4 × 96 × 2 = 50,331,648` 字节",
+      "24 MB / 48 MB",
+      "96 MB / 96 MB",
+      "48 MB / 48 MB——GQA 只减少计算量，不影响 cache 大小"
+    ],
+    "answer": [0],
+    "explain": "公式是 `2（K 和 V）× L × B × T × KV × D × bytes_per_elem`。代入：`2×8×1×4096×4×96×2 = 50,331,648` 字节 = 48 MB。把 `KV` 从 4 换成 8 正好翻倍 = 96 MB。注意这里乘的是 `num_key_value_heads` 而不是 `num_attention_heads`，因为 cache 存的是 `repeat_kv` **之前**的形态（L123 在 L124 之前）——GQA 省显存省的就是这一块；至于计算量，`repeat_kv` 撑开之后仍然是 H 个头在算 attention，并没有省。",
+    "ref": "model/model_minimind.py#L123"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "在 `generate` 里，从 `outputs.logits` 到 `next_token`，这几步的实际执行顺序是？",
+    "options": [
+      "repetition_penalty → temperature → top-p → top-k → 采样",
+      "top-k → top-p → temperature → repetition_penalty → 采样",
+      "temperature → repetition_penalty → top-k → top-p → 采样",
+      "temperature → top-k → top-p → repetition_penalty → 采样"
+    ],
+    "answer": [2],
+    "explain": "按行号读：L267 `logits = outputs.logits[:, -1, :] / temperature`，L268-L270 `repetition_penalty`，L271-L272 top-k，L273-L277 top-p，L278 `multinomial` / `argmax`。这个顺序有两个实际后果：① `repetition_penalty` 罚的是**已经被温度缩放过**的 logits，所以同一个 penalty 配不同 temperature 力度不同；② top-k 先把候选压到 k 个，top-p 再在这批里按概率质量砍，所以 top-k 是上限、top-p 决定实际留几个。",
+    "ref": "model/model_minimind.py#L267-L278"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "`MiniMindModel.forward` 开头有一行 `if hasattr(past_key_values, 'layers'): past_key_values = None`。它在防什么？",
+    "options": [
+      "防多卡 DataParallel 训练时 `self.layers` 被自动包一层",
+      "已经废弃的死代码，条件永远为假",
+      "防外部把 HF 的 `Cache` / `DynamicCache`（这类对象有 `.layers` 属性）当 `past_key_values` 传进来：MiniMind 自己的格式是 `list[tuple(k, v)]`，`Attention.forward` 只会按 `past_key_value[0]` / `[1]` 取值，读不懂它，于是直接丢弃、退化成不用 cache",
+      "防 MoE 模式下专家路由信息也被塞进 `past_key_values`"
+    ],
+    "answer": [2],
+    "explain": "`MiniMindForCausalLM` 仍然继承着 `transformers.GenerationMixin`（L234），所以完全可能有代码路径通过 HF 的标准机制调用进来、塞进一个 `DynamicCache`。MiniMind 的 `Attention.forward` 只认元组下标，遇到 Cache 对象会崩在一个很难定位的地方，于是这里认出「不是自己家的格式」就直接置 `None`。这一行本身就是「两套 cache 格式不兼容」的直接证据，也是 MiniMind 重写一份 `generate` 而不用继承来的那个的原因之一。",
+    "ref": "model/model_minimind.py#L211"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "用默认参数跑 `python eval_llm.py`，真正生效的采样设置是哪一组？",
+    "options": [
+      "temperature=0.85, top_p=0.85, top_k=50, repetition_penalty=1.0",
+      "temperature=0.85, top_p=0.95, top_k 未生效, repetition_penalty=1.1",
+      "temperature=1.0, top_p=0.95, top_k=50, repetition_penalty=1.0",
+      "temperature=0.85, top_p=0.95, top_k=50, repetition_penalty=1（等于整段 penalty 代码不执行）"
+    ],
+    "answer": [3],
+    "explain": "`eval_llm.py` 的命令行默认值：`--temperature 0.85`（L43）、`--top_p 0.95`（L44）。`top_k` 根本没有对应的命令行参数，调 generate 时也没传，所以吃的是 `generate` 签名里的默认值 `top_k=50`（L257）——它一直在生效，只是命令行上看不见。`repetition_penalty=1` 是 L86 硬编码的，`if repetition_penalty != 1.0` 判定为假，L268-L270 整段不执行。这就是为什么 `eval_llm.py` 的输出容易出现整句复读。",
+    "ref": "eval_llm.py#L82-L87"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "batch 里有两行一起生成。第 1 行在第 16 步采到了 eos，第 0 行还在继续说。第 17 步，被拼进第 1 行 `input_ids` 的 token 是什么？",
+    "options": [
+      "模型这一步正常采样出来的 token——`finished` 只用来决定什么时候 `break`",
+      "`pad_token_id`（`eval_llm.py` 确实把它传给了 generate）",
+      "`eos_token_id`：L279 的 `torch.where(finished.unsqueeze(-1), …)` 会把已完成行的 `next_token` 强制换成 eos，一直填到全 batch 结束",
+      "这一行不再被拼新 token，`input_ids` 变成各行长度不一的结构"
+    ],
+    "answer": [2],
+    "explain": "`input_ids` 是稠密张量，每一步所有行必须拼上等长的新列，没法让某一行原地停住（排除选项 D）。源码的做法是在 `cat` 之前先过一手 `torch.where`：已经 `finished` 的行，不管模型这一步采样/argmax 出什么，都被换成 `eos_token_id`（排除选项 A）。填的是 eos 而不是 pad，因为 `generate` 的签名里压根没有 `pad_token_id`（排除选项 B）。实验里第 1 行在第 16 步结束，循环跑到第 27 步才停，于是这一行里 `id=2` 出现了 12 次、尾部是 `[2, 2, 2, 2, 2]`。所以读结果必须 `skip_special_tokens=True` 或按第一个 eos 截断。",
+    "ref": "model/model_minimind.py#L279"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "prompt 22 个 token、贪心生成 64 个。`use_cache=False` 送进模型的 token 总数是有 cache 的 40 倍。那么墙上时间（wall clock）会慢多少？",
+    "options": [
+      "几乎没差别：KV cache 只省显存，不省时间",
+      "慢 3~5 倍——远小于计算量之比",
+      "慢 40 倍左右，和计算量之比基本一致",
+      "慢 64 倍以上，因为还要额外分配内存"
+    ],
+    "answer": [1],
+    "explain": "实测约 3~4 倍（不同机器、不同负载会有波动，但量级就在个位数）。计算量差 40 倍而时间只差 3~4 倍，是因为两条路径的「计算形状」完全不同：有 cache 时 decode 每步是 `[B, 1, C]` 的极瘦矩阵乘，算力喂不饱，时间花在逐层 kernel 启动和权重搬运上（访存受限）；无 cache 时每步喂的是 `[B, P+k, C]` 的胖矩阵，单位算力效率高得多。换句话说，KV cache 省掉的那 40 倍计算量本来就是最便宜的那一种。真实推理系统用 batch / continuous batching 把 decode 的矩阵重新变胖，冲的正是同一个问题。",
+    "ref": "model/model_minimind.py#L281"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "同一个 `top_p=0.85`，用在两条分布上：A 的 top1 概率是 0.752（尖锐），B 的 top1 只有 0.208（平坦）。两条各留下几个候选？",
+    "options": [
+      "都是 2 个左右——`top_p` 是个固定阈值，留下的数量不随分布变",
+      "A 留 2 个、B 留 16 个：分布越平，要凑够 0.85 的概率质量就得留越多的词",
+      "A 留 16 个、B 留 2 个",
+      "都是 1 个：`mask[..., 0] = 0` 的保底逻辑只让最高的那个活下来"
+    ],
+    "answer": [1],
+    "explain": "top-p 截的是**概率质量**不是数量：A 的前两名加起来就有 0.752+0.178=0.930，一越过 0.85 就停，只留 2 个；B 的概率摊得很开，要往下数到第 16 个才凑够 0.85。同一个参数、同一个模型，候选数差 8 倍——这就是 top-p 相对 top-k 的核心优势：它随分布自适应。选项 D 描述的保底只在 `top_p` 比 top1 自己的概率还小时才起决定作用（见 [右移一位与 scatter 回原顺序](#topp-scatter)）。",
+    "ref": "model/model_minimind.py#L273-L277"
+  }
+]

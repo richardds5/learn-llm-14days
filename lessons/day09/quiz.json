@@ -1,0 +1,310 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "你在自己的脚本里写 `from trainer.train_pretrain import train_epoch`，准备好一个非空的 `loader` 之后直接调用 `train_epoch(0, loader, len(loader))`。会发生什么？",
+    "options": [
+      "抛 `NameError: name 'args' is not defined`",
+      "正常训练：`train_epoch` 会自动用 `train_pretrain.py` 里 argparse 的默认参数",
+      "抛 `TypeError`：`train_epoch` 还缺必填参数",
+      "能跑完但不更新参数，因为此时 `optimizer` 是 `None`"
+    ],
+    "answer": [0],
+    "explain": "函数体里的自由变量是在**定义它的那个模块**的命名空间里查找的。`import` 会执行 `trainer/train_pretrain.py` 的模块级代码，但 `if __name__ == \"__main__\":` 块被跳过，所以 `args` / `model` / `optimizer` / `scaler` / `autocast_ctx` / `lm_config` 这几个名字在该模块里压根不存在。实测报的就是 `NameError: name 'args' is not defined`，炸点在循环体第一行 `input_ids.to(args.device)`（`loader` 为空时循环不进入，反而不报错）。选项 C 不成立：`iters` 之后的两个参数都有默认值。这也是本课所有训练实验都自己搭一遍循环、而不是 import `train_epoch` 的原因。",
+    "ref": "trainer/train_pretrain.py#L24-L28"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "把 `get_lr` 的返回式从 `lr*(0.1 + 0.45*(1 + cos(...)))` 改成 `lr*(0.5*(1 + cos(...)))`，训练起点和终点的 lr 分别变成多少？",
+    "options": [
+      "起点 `0.5·lr`，终点 `0`",
+      "两条公式等价，起点终点都不变",
+      "起点 `lr`，终点 `0.5·lr`",
+      "起点仍是 `lr`，终点从 `0.1·lr` 变成 `0`"
+    ],
+    "answer": [3],
+    "explain": "`current_step=0` 时 `cos(0)=1`：原式系数 `0.1+0.45×2 = 1.0`，新式 `0.5×2 = 1.0`，两者起点都等于 `lr`。`current_step=total_steps` 时 `cos(π)=-1`：原式 `0.1+0.45×0 = 0.1`，新式 `0.5×0 = 0`。所以这个改动只动终点——从保留 10% 步长变成彻底衰减到 0，最后几步几乎不再更新参数。实验里改 `total_steps` 只会横向压缩曲线，两端的比例完全由这两个常数决定。",
+    "ref": "trainer/trainer_utils.py#L41"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`--epochs 2 --learning_rate 5e-4`，每个 epoch 有 1000 个 batch。第 1 个 epoch 的最后一步（`epoch=0, step=1000`）上，`get_lr` 返回多少？",
+    "options": [
+      "`5e-4`——每个 epoch 都从最大学习率重新开始",
+      "`2.75e-4`",
+      "`5e-5`——一个 epoch 结束就衰减到底了",
+      "`2.5e-4`——线性衰减到一半"
+    ],
+    "answer": [1],
+    "explain": "`current_step = epoch*iters + step = 0*1000 + 1000 = 1000`，`total_steps = args.epochs*iters = 2000`，比值 0.5 → `cos(π/2)=0` → 系数 `0.1+0.45 = 0.55` → `0.55 × 5e-4 = 2.75e-4`。关键在于分母是**整个训练**的总步数而不是一个 epoch 的：两个 epoch 合起来才是一条完整的余弦，第 2 个 epoch 从 `0.55·lr` 接着往下走到 `0.1·lr`（实验里第二段曲线正是这样）。选项 A 描述的是误写成 `get_lr(step, iters, ...)` 之后的 cosine restart。",
+    "ref": "trainer/train_pretrain.py#L31"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "在 Mac 上跑 `python train_pretrain.py --device mps --dtype bfloat16`。`autocast_ctx` 最终是什么？前向得到的 `logits` 又是什么 dtype？",
+    "options": [
+      "`torch.cuda.amp.autocast(dtype=torch.bfloat16)`；`logits` 是 `torch.bfloat16`",
+      "直接抛异常：`torch.cuda.amp.autocast` 不接受 MPS 上的张量",
+      "`nullcontext()`；`logits` 是 `torch.float32`",
+      "`torch.autocast(\"mps\", dtype=torch.bfloat16)`；`logits` 是 `torch.bfloat16`"
+    ],
+    "answer": [2],
+    "explain": "看实验表格 `mps` 那一行：`device_type` 列是 `cpu`、`autocast_ctx 的类型` 列是 `nullcontext`；最后一行「本机实测」显示 `logits.dtype = torch.float32`。因为第一行只做 `\"cuda\" in args.device` 这个**字符串包含**判断，`\"cuda\" in \"mps\"` 是 `False`，于是走 else 得到 `\"cpu\"`，第三行据此选了 `nullcontext()`。第二行算出来的 `dtype=torch.bfloat16` 从头到尾没被用上。选项 D 是「正确写法」而不是这份代码的行为。",
+    "ref": "trainer/train_pretrain.py#L121-L123"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "想让这份脚本在 MPS 上**真正**启用 bfloat16 混合精度，下面哪个改法是对的？",
+    "options": [
+      "只把 `--dtype` 从 `bfloat16` 改成 `float16`",
+      "把 `args.device` 谎报成 `\"cuda:0\"`，让第一行判成 `\"cuda\"`",
+      "在 `init_model` 之后加一句 `model.half()`",
+      "把第一行改成 `device_type = args.device.split(':')[0]`，第三行改成 `torch.autocast(device_type, dtype=dtype)`"
+    ],
+    "answer": [3],
+    "explain": "问题出在两处都写死了 CUDA：设备类别的判断，和 `torch.cuda.amp.autocast` 这个实现。`torch.autocast(device_type, ...)` 是设备无关的通用入口，`\"mps\"` 是它支持的 device_type 之一，两处一起改才有效（实测这样改之后 `logits.dtype` 变成 `torch.bfloat16`）。A 只换 dtype，判断逻辑不变，`autocast_ctx` 还是 `nullcontext()`。B 会让张量留在 MPS 上却套一个 CUDA 的 autocast——实测不报错但也毫无作用，`logits` 仍是 fp32，而且 `args.device` 后面还会被当成真实设备用。C 的 `model.half()` 是**纯 fp16 训练**（master weights 也变 fp16），不是混合精度，很容易训崩。",
+    "ref": "trainer/train_pretrain.py#L121-L123"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "稠密模型（`use_moe=False`）前向之后，`res.aux_loss` 是什么？",
+    "options": [
+      "`None`——所以 `res.loss + res.aux_loss` 会抛 `TypeError`",
+      "Python 的 `float` 值 `0.0`",
+      "一个值为 0、`requires_grad=False` 的 **0 维 tensor**",
+      "形状为 `[1]` 的 tensor，所以 `loss` 会被广播成 `[1]`"
+    ],
+    "answer": [2],
+    "explain": "`model_minimind.py:231` 是 `sum([...], hidden_states.new_zeros(1).squeeze())`：稠密模型里没有 `MOEFeedForward`，列表是空的，`sum` 直接返回那个起始值——`new_zeros(1)` 形状是 `[1]`，`.squeeze()` 之后变成 0 维（实验表格 `res.aux_loss` 那一列显示 `0.000000 ()`，括号里的 shape 是空的）。它由 `new_zeros` 造出来，不在计算图上，实验最后两行打印的 `requires_grad=False`（MoE 那边是 `True`）说明了这点。正因为形状和类型统一，`res.loss + res.aux_loss` 这一行才能对两种模型通用，不需要任何分支。",
+    "ref": "model/model_minimind.py#L231"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "日志那行写的是 `current_loss = loss.item() * args.accumulation_steps`。如果把这个乘法去掉，会有什么影响？",
+    "options": [
+      "只有打印/上报的数值变成原来的 `1/N`，梯度和参数更新完全不受影响",
+      "梯度也会跟着变成原来的 `1/N`",
+      "什么都不会变，因为 `loss` 在前面已经乘回去了",
+      "学习率会跟着变小"
+    ],
+    "answer": [0],
+    "explain": "`loss` 在 `with autocast_ctx:` 块里已经被除过一次 `accumulation_steps`，而 `scaler.scale(loss).backward()` 用的就是除过的那个值——梯度在那一行就定型了，日志行只是 `.item()` 取个标量再乘回来，纯展示。乘回去的目的是让打印出来的数和「不做梯度累积」时可比。实验表格最后两列正是这次除法和这次乘法的对照：`loss/8` 和 `loss.item()*8`，后者恰好等于 `res.loss + res.aux_loss`。",
+    "ref": "trainer/train_pretrain.py#L53"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "8 条样本的有效 token 数分别是 `[3, 5, 9, 11, 4, 10, 6, 7]`（其余位置的 label 是 `-100`）。「拆成 4 个 micro-batch、每次 `loss/4` 再 `backward`」和「一次性算这 8 条」，两者得到的梯度最大相差多少？",
+    "options": [
+      "完全相等，差值就是 0",
+      "`1e-8` 量级——只有浮点累加顺序造成的误差",
+      "`1e-4` 量级——小到可以忽略",
+      "`1e-1` 量级——和梯度本身同一个数量级"
+    ],
+    "answer": [3],
+    "explain": "看实验表格两行的对比：每条样本都是 11 个有效 token 时，最大差是 `2e-08`（纯浮点误差，等价成立）；换成长短不齐的 `[3,5,9,11,4,10,6,7]` 之后变成 `1.4e-01`。原因在 `F.cross_entropy(reduction='mean')` 的分母是「**这一次调用里**的有效 token 数」：`(loss₁+loss₂+loss₃+loss₄)/4` 是 4 个「各自 token 平均」的再平均，而一次算 8 条是对全部 55 个 token 的一次平均——短样本在前者里被放大了权重。",
+    "ref": "trainer/train_pretrain.py#L38"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "要让「累积 4 步」和「一次大 batch」的梯度严格相等，下面哪个条件是必须的？",
+    "options": [
+      "把 `accumulation_steps` 调得足够大",
+      "每个 micro-batch 的**有效 token 数**相同（样本等长，或者根本没有被 mask 掉的位置）",
+      "把 `loss / accumulation_steps` 改成 `loss / batch_size`",
+      "在 `backward()` 之前对 `loss` 调一次 `.detach()`"
+    ],
+    "answer": [1],
+    "explain": "不等价的根源是每个 micro-batch 的 `cross_entropy` 各自按自己的有效 token 数取平均，所以只要这个分母在各 micro-batch 之间一致，「平均的平均」就等于「一次平均」——实验第一行（每条都是 11 个有效 token）实测差 `2e-08`。A 会让分母更不均匀，差距通常更大（micro batch 越小，token 数波动越剧烈）；C 只是换了个常数缩放，改变不了各 micro-batch 内部的加权；D 会切断计算图，`backward()` 直接报错。工程上真正的修法是把 loss 改成 `reduction='sum'` 再统一除以全局有效 token 数，但那就不是这份脚本的写法了。",
+    "ref": "trainer/train_pretrain.py#L38-L40"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "脚本默认 `--dtype bfloat16`。此时 `scaler.scale(loss)` 实际做了什么？",
+    "options": [
+      "把 `loss` 转换成 bfloat16 再返回",
+      "把 `loss` 乘上一个根据历史梯度动态调整的放大因子（默认起始 65536）",
+      "原样返回同一个 `loss` 对象；后面的 `unscale_` / `step` / `update` 也全部退化成透传",
+      "抛异常，因为 `GradScaler` 不支持 bfloat16"
+    ],
+    "answer": [2],
+    "explain": "`scaler = GradScaler(enabled=(args.dtype == 'float16'))`，bfloat16 时 `enabled=False`。实验表格第一行：`is_enabled()` 是 `False`、`scale(loss) is loss` 是 `True`、`unscale_` 前后的 `|grad|max` 一模一样。第三行的对照组 `torch.amp.GradScaler(\"cpu\", enabled=True)` 才是真启用的样子：`scale(loss) is loss` 变成 `False`，backward 之后梯度是 `2.7e+04`，`unscale_` 之后回到 `4.2e-01`，正好差 65536 倍。另外留意第二行——即使显式写 `--dtype float16`，在没有 CUDA 的机器上 `GradScaler` 也会自己把 `enabled` 改回 `False`。",
+    "ref": "trainer/train_pretrain.py#L138"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "某一步 `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)` 返回了 `5.0`。这一行执行完之后，所有 `.grad` 拼成一个长向量的 L2 范数是多少？",
+    "options": [
+      "`1.0`——所有 `.grad` 统一乘上了 `1.0/5.0 = 0.2`，梯度方向不变",
+      "`5.0`——返回值就是裁剪后的范数，`.grad` 本身没被改动",
+      "`1.0`——但只有单个范数超过 1.0 的那些参数被缩放，其余保持原样",
+      "`0.2`"
+    ],
+    "answer": [0],
+    "explain": "`clip_grad_norm_` 返回的是**裁剪前**的全局范数；超过 `max_norm` 时把每个 `.grad` 原地乘上同一个系数 `max_norm/total_norm`，所以裁剪后总范数恰好等于 `max_norm=1.0`，而各参数之间的比例（也就是梯度方向）一点没变。实验的两条曲线就是这件事：上面那条是返回值，下面那条是裁剪后重新算的——超阈值的 13 步全被压平到 1.0，没超的步两条曲线完全重合。选项 C 描述的是逐参数各裁各的，`clip_grad_norm_` 不是这么做的（那是 `clip_grad_value_` 的风格）。",
+    "ref": "trainer/train_pretrain.py#L44"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "一个 epoch 有 10 个 batch、`accumulation_steps=3`、`start_step=0`。这个 epoch 里 `optimizer.step()` 一共被调用几次？",
+    "options": [
+      "10 次",
+      "3 次",
+      "1 次",
+      "4 次"
+    ],
+    "answer": [3],
+    "explain": "循环内 `step % 3 == 0` 在 step=3 / 6 / 9 触发 3 次；循环结束时 `last_step=10`，`10 % 3 = 1 ≠ 0` 且 `10 > start_step`，epoch 末尾的「尾巴」再补 1 次，共 4 次。实验表格逐步列出了每一步是「只累积」还是「更新」，最后一行就是这次补更新。注意第 10 步那一批梯度并没有被扔掉——这正是尾巴存在的意义。",
+    "ref": "trainer/train_pretrain.py#L75-L80"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "如果一个 epoch 的 batch 数恰好能被 `accumulation_steps` 整除，epoch 末尾那段补更新的代码会执行吗？",
+    "options": [
+      "会执行，于是同一批梯度被 `step()` 了两次",
+      "不会：`last_step % args.accumulation_steps == 0` 让条件为 `False`",
+      "会执行，但 `clip_grad_norm_` 会因为 `.grad` 已经是 `None` 而报错",
+      "取决于 `save_interval` 能不能整除 `last_step`"
+    ],
+    "answer": [1],
+    "explain": "条件是 `last_step > start_step and last_step % args.accumulation_steps != 0`，整除时后半个条件为 `False`，整段跳过——因为最后一步已经在循环体内触发过 `step % accumulation_steps == 0`，unscale/clip/step/update/zero_grad 全做完了，`.grad` 也被 `set_to_none=True` 清成了 `None`。实验的 task 让你把 `iters` 从 10 改成 9 亲眼验证。顺带一提选项 C：`clip_grad_norm_` 会跳过 `.grad is None` 的参数，全为 `None` 时只是返回 `tensor(0.)`，并不会报错。",
+    "ref": "trainer/train_pretrain.py#L75"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "用 `lm_checkpoint` 存一次盘，再用加载模式把 `_resume.pth` 读回来。`ckp['model']` 里的权重，和保存前的 `model.state_dict()` 相比会怎样？",
+    "options": [
+      "完全一致：`torch.save` / `torch.load` 对 fp32 张量是无损的",
+      "完全一致，只是 dtype 变成了 `float64`",
+      "有差异，逐元素相对误差大约 `5e-4`",
+      "有差异，逐元素相对误差大约 `1e-7`（fp32 的机器精度）"
+    ],
+    "answer": [2],
+    "explain": "看实验表格：`ckp['model'] 的 dtype` 是 `torch.float16`，`‖Δw‖/‖w‖` 最大 `2.1e-04`，逐元素相对误差最大 `4.88e-04`——正好是 fp16 尾数 10 位对应的上界 `2⁻¹¹ = 4.88e-04`。原因是 `trainer_utils.py:73` 把整个 `state_dict` 换成了 `{k: v.half().cpu()}`，而 `:86` 的 `resume_data['model']` 引用的就是这同一个变量，并没有另存一份 fp32。选项 D 是 fp32 往返才有的量级，这里根本没发生 fp32 往返。对照一下同一个文件里 Adam 的 `exp_avg` / `exp_avg_sq`——它们是完整 fp32。",
+    "ref": "trainer/trainer_utils.py#L73"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "`lm_checkpoint(lm_config, weight='pretrain', save_dir='../checkpoints')`——注意没有传 `model=`。这次调用做了什么？",
+    "options": [
+      "走加载模式：读 `../checkpoints/pretrain_768_resume.pth`，存在就返回续训用的 dict，不存在返回 `None`",
+      "保存一份当前模型的 checkpoint（`model` 会自动从全局找）",
+      "抛 `TypeError`：`model` 是必填参数",
+      "删除旧的 checkpoint 文件，为新一轮训练腾地方"
+    ],
+    "answer": [0],
+    "explain": "函数用 `if model is not None:` 区分两种模式，而 `model` 的默认值就是 `None`。加载模式只做三件事：判断 `_resume.pth` 在不在；在就 `torch.load(..., map_location='cpu')` 读回来；`world_size` 和当前不一致就把 `step` 按比例换算再返回。`main` 里第 ② 步 `ckp_data = lm_checkpoint(...) if args.from_resume==1 else None` 正是这么用的——先探测有没有存档，再决定要不要恢复。",
+    "ref": "trainer/trainer_utils.py#L107-L116"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "`SkipBatchSampler(list(range(40)), batch_size=4, skip_batches=3)`：`len()` 是多少？第一次 `yield` 出来的是哪一批下标？",
+    "options": [
+      "`len()=10`，第一批是 `[0, 1, 2, 3]`",
+      "`len()=7`，第一批是 `[0, 1, 2, 3]`",
+      "`len()=10`，第一批是 `[12, 13, 14, 15]`",
+      "`len()=7`，第一批是 `[12, 13, 14, 15]`"
+    ],
+    "answer": [3],
+    "explain": "`__len__` 算的是 `ceil(40/4) - 3 = 10 - 3 = 7`。`__iter__` 照常按 4 个一批地攒，但前 3 批攒够之后直接丢弃（`skipped += 1; batch = []; continue`），所以第一个真正 `yield` 出来的是原序列的第 3 批 `[12,13,14,15]`——实验表格里 `batch 3` 那一行写的就是「第 0 个 yield 出来」。被跳过的和保留下来的是同一条序列上的前后两段，顺序没有任何变化，这正是续训能和不中断训练对齐的原因。",
+    "ref": "trainer/trainer_utils.py#L140-L157"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "对比两个脚本 argparse 里的默认值，下面哪一条是**错**的？",
+    "options": [
+      "`train_pretrain.py` 是 `accumulation_steps=8`，`train_full_sft.py` 是 `1`",
+      "`train_full_sft.py` 的 `from_weight` 默认是 `'none'`，即从随机初始化直接开始 SFT",
+      "`train_pretrain.py` 是 `learning_rate=5e-4`，`train_full_sft.py` 是 `1e-5`",
+      "`train_pretrain.py` 是 `max_seq_len=340`，`train_full_sft.py` 是 `768`"
+    ],
+    "answer": [1],
+    "explain": "`train_full_sft.py:104` 的默认值是 `'pretrain'`——接着预训练权重继续训，这正是流水线里两个阶段的衔接点；`'none'` 是 `train_pretrain.py:103` 的默认值（预训练从 0 开始）。其余三条都能在两份 argparse 里逐行核对到。顺带记住 `from_weight` 的消费者是 `init_model`：值为 `'none'` 就跳过 `torch.load`，否则按 `{save_dir}/{from_weight}_{hidden_size}{moe_suffix}.pth` 拼路径加载，并且用 `strict=False`。",
+    "ref": "trainer/train_full_sft.py#L104"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "DDP 模式下，`SkipBatchSampler(train_sampler or indices, args.batch_size, skip)` 里真正被用上的是谁？",
+    "options": [
+      "`indices`，因为它在右边、是后算出来的，会覆盖前面",
+      "两者会被合并，以保证各卡拿到一致的顺序",
+      "`train_sampler` 本身；上一行 `randperm` 出来的 `indices` 一个都没用上",
+      "DDP 下 `train_sampler` 会被设成 `None`，所以还是走 `indices`"
+    ],
+    "answer": [2],
+    "explain": "`or` 是短路求值：左边是真值就直接返回左边，右边连算都不算（这里右边早就算好了，只是没被取用）。非 DDP 时 `train_sampler is None`（假值）→ 取 `indices`；DDP 时它是一个 `DistributedSampler` 实例（非空对象，真值）→ 直接返回它。实验表格里单卡那两行的顺序来自 `setup_seed(seed+epoch)` + `randperm`，双卡两行则由 `DistributedSampler` 把 12 条样本切成互不重叠的两半——决定顺序的是 `train_sampler.set_epoch(epoch)`，和 `indices` 无关。",
+    "ref": "trainer/train_pretrain.py#L162"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "把 `--accumulation_steps` 从 8 改成 1，其余参数全部不动。下面哪一项**不会**变？",
+    "options": [
+      "日志里打印出来的 `current_loss`",
+      "一个 epoch 里 `optimizer.step()` 被调用的次数",
+      "每一次 `backward()` 所用的 `loss` 数值",
+      "一次参数更新对应的等效 batch size"
+    ],
+    "answer": [0],
+    "explain": "`current_loss = loss.item() * args.accumulation_steps`，而 `loss` 本身是 `(res.loss + res.aux_loss) / args.accumulation_steps`——一除一乘正好抵消，所以日志里的数永远是「这一个 micro-batch 的原始 loss」，与 N 无关（这正是那次乘法的目的）。另外三项都会变：`step()` 从每 8 步一次变成每步一次；`backward` 用的 loss 大了 8 倍；等效 batch 从 `32×8=256` 缩回 32。",
+    "ref": "trainer/train_pretrain.py#L38"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "8 卡训练到 `epoch=1, step=500` 时存了 checkpoint，之后改用 4 卡续训。恢复出来的 `start_step` 是多少？",
+    "options": [
+      "500，step 是全局计数，和卡数无关",
+      "250",
+      "125",
+      "1000"
+    ],
+    "answer": [3],
+    "explain": "加载模式里 `ckp_data['step'] = ckp_data['step'] * saved_ws // current_ws = 500 * 8 // 4 = 1000`。因为 `step` 记的是「**每张卡各自的** DataLoader 走到第几个 batch」：8 卡时全局已经消费了约 `500×8` 个 batch，改成 4 卡后每张卡要分担的量翻倍，所以本卡应该从第 1000 个 batch 之后接着训。这个值会一路传给 `SkipBatchSampler(..., skip=1000)` 和 `train_epoch(..., iters=len(loader)+1000, start_step=1000)`。",
+    "ref": "trainer/trainer_utils.py#L112-L114"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "下面哪一条是 `train_epoch` 一次迭代的真实顺序？",
+    "options": [
+      "前向 → 设 lr → backward → clip_grad_norm_ → unscale_ → step",
+      "设 lr → autocast 前向 → loss 除以 N → backward → unscale_ → clip_grad_norm_ → step → update → zero_grad",
+      "设 lr → 前向 → backward → zero_grad → unscale_ → clip_grad_norm_ → step",
+      "autocast 前向 → loss 除以 N → 设 lr → backward → clip_grad_norm_ → unscale_ → step → zero_grad"
+    ],
+    "answer": [1],
+    "explain": "逐项对照源码：lr 在前向之前就设好并写回 `param_groups`（L31-33）；loss 在 autocast 块内相加并除以 N（L37-38）；`scaler.scale(loss).backward()` 在块外（L40）；更新那五行严格是 unscale_ → clip → step → update → zero_grad（L43-49）。两处顺序不能换：`unscale_` 必须在 clip 之前（否则裁剪的是被放大过的假梯度），`zero_grad` 必须在 `step` 之后（否则梯度还没用就被清空了）。",
+    "ref": "trainer/train_pretrain.py#L31-L49"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "一个 epoch 有 1000 个 batch，`--log_interval 100 --save_interval 1000`，单卡训练。这个 epoch 里 `Logger` 打了几次日志、往 `out/` 存了几次权重？",
+    "options": [
+      "日志 10 次，保存 1 次",
+      "日志 11 次，保存 2 次——`step == iters` 会让最后一步各再触发一次",
+      "日志 10 次，保存 2 次",
+      "日志 1000 次，保存 1 次"
+    ],
+    "answer": [0],
+    "explain": "两个条件都写成 `step % interval == 0 or step == iters`，`or` 后面那半是给「`iters` 不能被 interval 整除」兜底的，保证 epoch 的最后一步一定会打日志 / 存盘。这里 `iters=1000` 同时满足两边，但每个 `if` 只是一个分支，不会执行两遍。所以日志在 step=100,200,…,1000 共 10 次，保存只在 step=1000 一次。把 `iters` 改成 1050，日志才会变成 11 次（1000 和 1050 各一次）。",
+    "ref": "trainer/train_pretrain.py#L51-L61"
+  }
+]

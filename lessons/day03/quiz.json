@@ -1,0 +1,285 @@
+[
+  {
+    "id": "q1",
+    "type": "single",
+    "question": "真实模型里 `head_dim = 96`。`model/model_minimind.py:63` 这一行执行完，`freqs` 的 shape 是？",
+    "options": ["`[96]`", "`[32768, 48]`", "`[48]`", "`[32768, 96]`"],
+    "answer": [2],
+    "explain": "看实验里 L63 被拆开后的最后一个子表达式：`1.0 / (rope_base ** (...))  →  [48] float32`。`torch.arange(0, 96, 2)` 给出 0,2,…,94 共 48 个数，整条链路都是逐元素运算，shape 一路是 `[D/2] = [48]`——96 个通道两两一对，每对共用一个转速。`32768` 这个维度要到 L75 的 `torch.outer(t, freqs)` 才被引入，`96` 要到 L76 的 `torch.cat` 才出现。",
+    "ref": "model/model_minimind.py#L63"
+  },
+  {
+    "id": "q2",
+    "type": "single",
+    "question": "L63 里的 `torch.arange(0, dim, 2)[: (dim // 2)]`，这个切片在 `dim=96` 和 `dim=97` 两种情况下分别切掉了几个元素？",
+    "options": [
+      "两种情况都切掉 48 个，切片是必须的",
+      "`dim=96` 切掉 0 个（`arange` 本来就是 48 个），`dim=97` 切掉 1 个（`arange` 给 49 个）",
+      "两种情况都不切，`arange` 的步长已经保证了长度",
+      "`dim=96` 切掉 1 个，`dim=97` 切掉 0 个"
+    ],
+    "answer": [1],
+    "explain": "`arange(0, 96, 2)` 的长度是 `ceil(96/2) = 48`，正好等于 `dim // 2`，切片一个都没切掉；`arange(0, 97, 2)` 的长度是 `ceil(97/2) = 49`，比 `97 // 2 = 48` 多一个，这时切片才真正起作用。所以它是一句针对奇数 `head_dim` 的防御性写法（实验 task 1 就是让你把 `dim` 改成 97 亲眼看一遍）。顺带一提，`dim=97` 时这个函数不会报错，但 `cat` 出来的表是 `[end, 96]`，和 `head_dim=97` 对不上，后面才会炸。",
+    "ref": "model/model_minimind.py#L63"
+  },
+  {
+    "id": "p1",
+    "type": "single",
+    "question": "把 `rope_theta` 从 MiniMind 的 `1e6` 换成 Llama2 惯用的 `1e4`，**最高频那个分量（`i = 0`）** 的波长会怎么变？",
+    "options": [
+      "缩短到原来的 1/100（从 6.28 变成 0.063）",
+      "不变，仍然是 `2π ≈ 6.28`",
+      "拉长到原来的 100 倍",
+      "变成 `2π · 1e4 ≈ 62832`"
+    ],
+    "answer": [1],
+    "explain": "波长是 `2π · rope_base^(2i/D)`，`i = 0` 时指数是 0，`任何底数的 0 次方都是 1`，所以 `freqs[0]` 恒等于 1、波长恒等于 2π——底数换成多少都没用。实验里两条曲线在左端完全重合，两行 print 的「i=0 波长」都是 `6.28`。被 `rope_theta` 撬动的只有指数接近 1 的低频端：`i=47` 时 `1e6` 给出 4,711,726，`1e4` 只有 51,862。这也是为什么调大 theta 能延长远距离量程，却不会影响相邻 token 的分辨率。",
+    "ref": "model/model_minimind.py#L63"
+  },
+  {
+    "id": "q3",
+    "type": "single",
+    "question": "`head_dim = 96`、`max_position_embeddings = 32768`。`rope_theta = 1e6` 和 `rope_theta = 1e4` 下，48 个频率分量里各有几个的波长**超过 32768**（也就是在整个窗口里连一圈都转不完）？",
+    "options": ["48 个和 48 个", "24 个和 12 个", "1 个和 0 个", "18 个和 3 个"],
+    "answer": [3],
+    "explain": "实验最后两行 print 直接给出了答案：`rope_theta=1e6` 是 18/48，`rope_theta=1e4` 是 3/48。波长 = `2π·base^(2i/D)`，要超过 32768 需要 `base^(2i/96) > 5215`，底数越大满足的 `i` 越多。这 18 个「转不满一圈」的分量提供的是单调、不会回绕的远距离信号，是 MiniMind 敢把窗口开到 32768 的直接原因。",
+    "ref": "model/model_minimind.py#L27-L29"
+  },
+  {
+    "id": "q4",
+    "type": "single",
+    "question": "把 L76 的 `torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)` 换成 `torch.cos(freqs).repeat_interleave(2, dim=-1)`，其余代码一律不动。会发生什么？",
+    "options": [
+      "shape 仍是 `[end, D]`，不会报任何错，但 `rotate_half` 的配对关系全错，attention 分数跟着静默算错",
+      "shape 变成 `[end, 2D]`，L82 的广播会立刻报错",
+      "完全等价，只是两种写法，结果逐元素相同",
+      "只有开启 YaRN 时两者才有区别"
+    ],
+    "answer": [0],
+    "explain": "`D/2` 个值各重复两次仍然是 `D` 个，所以 shape 不变、不报错——这正是危险的地方。区别在排布：`cat` 给出 `θ₀…θ₄₇, θ₀…θ₄₇`（第 `j` 列 == 第 `j+48` 列，实验里 `torch.equal(cos[:, :48], cos[:, 48:])` 是 `True`），`repeat_interleave` 给出 `θ₀,θ₀,θ₁,θ₁,…`（同一个检查会变成 `False`）。而 `rotate_half` 配的对是 `(x[i], x[i+48])`，它要的是前一种排布；后一种排布对应的是 GPT-J / Meta 原版那种 `(x[2i], x[2i+1])` 的配对，两套必须成对使用。",
+    "ref": "model/model_minimind.py#L76"
+  },
+  {
+    "id": "q5",
+    "type": "single",
+    "question": "用 KV cache 逐 token 解码：`past_key_values[0][0].shape` 是 `[3, 7, 4, 96]`，这一次只喂 1 个新 token。`position_embeddings` 里 `cos` 的 shape 是？",
+    "options": ["`[7, 96]`", "`[8, 96]`", "`[1, 96]`", "`[3, 1, 96]`"],
+    "answer": [2],
+    "explain": "看实验表格第二行：`start_pos = 7`（cache 里 `xk` 的 `shape[1]`），`input_ids` 是 `[3, 1]`，于是 `freqs_cos[7 : 7+1]` 的 shape 是 `[1, 96]`。切片长度等于**这一次新增的 token 数**，不是历史总长——历史位置的 k 早在进 cache 之前就已经旋转过了（L119 在 L121 的 `torch.cat` 之前）。选项 D 错在 `cos` 没有 batch 维，一批样本共用同一段位置。",
+    "ref": "model/model_minimind.py#L213-L219"
+  },
+  {
+    "id": "q6",
+    "type": "single",
+    "question": "L213 读的是 `past_key_values[0][0].shape[1]`。如果照搬 HF 那种 `[B, H, T, D]` 布局的写法改成 `.shape[2]`，在 MiniMind 里会读到什么？",
+    "options": [
+      "读到 `num_key_value_heads = 4`：带 cache 的每一步 `start_pos` 都恒为 4，切片长度仍然对但起点全错，而且不会报错",
+      "读到的还是序列长度，结果完全一样",
+      "`IndexError`：cache 里的张量只有 3 维",
+      "读到 `head_dim = 96`，切片越界直接报错"
+    ],
+    "answer": [0],
+    "explain": "MiniMind 的 KV cache 是 `[B, T, KV, D]`——`Attention.forward` L121 沿 `dim=1` 做 `torch.cat`，所以序列维留在第 1 维（实验表格最后一列打印的就是 `[3, 7, 4, 96]` → `[3, 8, 4, 96]`）。`shape[2]` 取到的是 `num_key_value_heads = 4`，于是每一次带 cache 的调用里 `start_pos` 都恒等于 4（第一次没有 cache，走的是 `else 0` 那一支）：切出来的 `cos` 长度仍然等于 `seq_length`（不越界、不报错），但所有新 token 都被当成位置 4、5、6… 这类「布局假设不同导致的静默错位」是跨仓库抄代码最常见的坑。",
+    "ref": "model/model_minimind.py#L121"
+  },
+  {
+    "id": "q7",
+    "type": "single",
+    "question": "`cos` 的 shape 是 `[T=7, D=96]`。`cos.unsqueeze(unsqueeze_dim)`（默认 `unsqueeze_dim=1`）之后是？",
+    "options": ["`[1, 7, 96]`", "`[7, 96, 1]`", "`[3, 7, 1, 96]`", "`[7, 1, 96]`"],
+    "answer": [3],
+    "explain": "看实验里 L82 被拆开后的第一个子表达式：`cos.unsqueeze(unsqueeze_dim)  →  [T=7, 1, D=96]`。`unsqueeze(1)` 在第 1 个位置插入一个长度为 1 的新维度，原来的 `D` 被顺移到第 2 位。之后和 `[B,T,H,D]` 相乘时，广播规则会在最前面再补一维，等价于 `[1, T, 1, D]`——一个 `unsqueeze` 同时把 `B` 和 `H` 都广播掉了。选项 A 是 `unsqueeze(0)`，选项 B 是 `unsqueeze(2)`（会在第 2 维上撞 96 vs 8）。",
+    "ref": "model/model_minimind.py#L82"
+  },
+  {
+    "id": "q8",
+    "type": "single",
+    "question": "混合精度下 `q` 是 `bfloat16`，而 `cos` 永远是 `float32`（L75 的 `.float()`）。`q * cos.unsqueeze(1)` 的 dtype，和 `apply_rotary_pos_emb` 返回值的 dtype，分别是？",
+    "options": [
+      "都是 `bfloat16`：PyTorch 会把 `cos` 降到 `q` 的精度再算",
+      "前者 `float32`（类型提升），后者 `bfloat16`（末尾的 `.to(q.dtype)` 转回来）",
+      "都是 `float32`：一旦被提升就回不去了",
+      "报错：两个 dtype 不同不能直接相乘"
+    ],
+    "answer": [1],
+    "explain": "PyTorch 的类型提升规则会把两个浮点 dtype 提到更宽的那个，所以 `bf16 * fp32 = fp32`，整条旋转在 fp32 里算完（实测 `(q * cos.unsqueeze(1)).dtype == torch.float32`）——这是好事，旋转的精度不会被吃掉。但如果就这么返回，`q_embed` 是 fp32，后面的 `scaled_dot_product_attention` 要么 dtype 对不上、要么背着一个 fp32 的 q 做矩阵乘法。L82 末尾的 `.to(q.dtype)` 就是把这份临时的高精度收回来（实测返回值是 `torch.bfloat16`）。",
+    "ref": "model/model_minimind.py#L82"
+  },
+  {
+    "id": "q9",
+    "type": "single",
+    "question": "`D = 8`、`x = [1, 2, 3, 4, 5, 6, 7, 8]`。`rotate_half(x)` 的结果是？",
+    "options": [
+      "`[5, 6, 7, 8, 1, 2, 3, 4]`",
+      "`[-5, -6, -7, -8, 1, 2, 3, 4]`",
+      "`[-2, 1, -4, 3, -6, 5, -8, 7]`",
+      "`[-1, -2, -3, -4, 5, 6, 7, 8]`"
+    ],
+    "answer": [1],
+    "explain": "源码是 `torch.cat((-x[..., D//2:], x[..., :D//2]), dim=-1)`：**后半取负搬到前面，前半原样搬到后面**，实验表格第二行 print 的就是 `[-5, -6, -7, -8, 1, 2, 3, 4]`。配上 L82 的 `x*cos + rotate_half(x)*sin`，第 `i` 位算出的是 `x_i·cosθ - x_{i+4}·sinθ`，第 `i+4` 位算出的是 `x_i·sinθ + x_{i+4}·cosθ`，正是 2D 旋转。选项 C 是 GPT-J 的 `rotate_every_two`（相邻两个交换并给其中一个取负），对应的是另一套配对约定；选项 D 把取负的那一半弄反了。",
+    "ref": "model/model_minimind.py#L81"
+  },
+  {
+    "id": "q10",
+    "type": "single",
+    "question": "实验画出的 `dots[m, n] = ⟨R_m q, R_n k⟩` 热力图（`q`、`k` 的内容固定，只改位置）上，哪一组格子的数值相同？",
+    "options": [
+      "同一行（`m` 相同）的所有格子",
+      "同一列（`n` 相同）的所有格子",
+      "同一条对角线（`m − n` 相同）的所有格子",
+      "全部格子都相同，因为 `q`、`k` 的内容自始至终没变"
+    ],
+    "answer": [2],
+    "explain": "旋转矩阵是正交的，`R_mᵀ R_n = R_{n-m}`，所以 `⟨R_m q, R_n k⟩ = qᵀ R_{n-m} k` 只依赖相对距离。实验 print 出的两个数就是证据：`dots[5,20]` 和 `dots[25,40]`（`m-n` 都是 −15）相差 `7.75e-07`，而只挪一格的 `dots[5,21]`（`m-n = -16`）就差了 1.59。选项 D 错在相对距离变了值就会变——真要「全部相同」，得把所有位置的旋转都关掉。",
+    "ref": "model/model_minimind.py#L80-L84"
+  },
+  {
+    "id": "q11",
+    "type": "single",
+    "question": "把 MiniMind（`rotate_half`，前后两半配对）训出来的 `q_proj` / `k_proj` 权重原封不动喂给 Meta 原版 `llama.py`（`view_as_complex`，相邻两个下标配对）的 RoPE 实现，会发生什么？",
+    "options": [
+      "完全没有影响，两种实现数学上等价，权重本来就通用",
+      "attention 分数会算错：两种约定把同一个频率分配给了不同的输入通道，必须先按 `[0,2,4,…,1,3,5,…]` 重排输出通道",
+      "只需要把权重矩阵整体转置一下就能兼容",
+      "只有序列长度超过 2048 时才会出错，短序列不受影响"
+    ],
+    "answer": [1],
+    "explain": "实验表格两行给出了全部证据：同一个向量、同一组角度，直接比两种实现最大差 `2.333`（不一样）；先按 `perm = [0,2,4,6,1,3,5,7]` 重排通道再比，最大差 `2.38e-07`（完全一致）。这正是 HF 的 `convert_llama_weights_to_hf.py` 里 `permute()` 函数在做的事。跟序列长度毫无关系——任何位置都会错，而且不会报任何错。",
+    "ref": "model/model_minimind.py#L81"
+  },
+  {
+    "id": "q12",
+    "type": "single",
+    "question": "默认 YaRN 配置（`dim=96`、`rope_base=1e6`、`beta_fast=32`、`beta_slow=1`、`original_max_position_embeddings=2048`）下，L71 算出的 `low, high` 是？",
+    "options": ["`low=32, high=1`（直接取 `beta_fast` / `beta_slow`）", "`low=0, high=47`（覆盖全部 48 个分量）", "`low=21, high=8`", "`low=8, high=21`"],
+    "answer": [3],
+    "explain": "实验前两行 print 的就是中间结果：`inv_dim(32) = 8.064 → low = floor(...) = 8`，`inv_dim(1) = 20.105 → high = ceil(...) = 21`。公式是 `inv_dim(b) = dim·log(orig_max / (b·2π)) / (2·log(rope_base))`，`b` 越大代表要求的波长越长、对应的分量下标越小，所以 `beta_fast=32` 反而给出更小的 `low`。`max(..., 0)` 和 `min(..., dim//2-1)` 只是把结果夹在合法范围内，这组参数下都没触发。",
+    "ref": "model/model_minimind.py#L70-L71"
+  },
+  {
+    "id": "q13",
+    "type": "single",
+    "question": "把 `beta_fast` 从 32 改成 8，其余参数不变。`low` 和「频率完全不被缩放（γ=0）的分量个数」分别怎么变？",
+    "options": [
+      "`low` 从 8 变成 12，不缩放的分量从 9 个变成 13 个",
+      "`low` 从 8 变成 2，不缩放的分量变少",
+      "`low` 不变，只有 `high` 会变",
+      "`low` 从 8 变成 12，但不缩放的分量个数不变（仍是 9 个）"
+    ],
+    "answer": [0],
+    "explain": "`inv_dim(8) = 12.880`，`floor` 之后 `low = 12`（`inv_dim(32) = 8.064` → 8）。`ramp = clamp((i - low) / (high - low), 0, 1)` 在 `i ≤ low` 时恒为 0，所以 γ=0 的分量从 `i ∈ [0, 8]` 的 9 个变成 `i ∈ [0, 12]` 的 13 个——「原封不动」的高频区变宽了，同时因为 `high` 仍是 21，中间的线性过渡区从 12 个压缩到 8 个。直觉上：`beta_fast` 是在说「波长短于 `2π·beta_fast` 个位置的分量不许动」，把它调小等于放宽了保护范围的下界。",
+    "ref": "model/model_minimind.py#L70-L72"
+  },
+  {
+    "id": "p2",
+    "type": "single",
+    "question": "`MiniMindConfig(max_position_embeddings=1024, inference_rope_scaling=True)`：开关是打开的，`rope_scaling` 那个 dict 也构造出来了。它算出的 `freqs_cos`，和完全不开 YaRN 时那张表的前 1024 行相比会是什么关系？",
+    "options": [
+      "低频那一段被压缩了，两张表在右半边不同",
+      "逐元素完全相同——YaRN 那一段分支根本没执行",
+      "整张表都不同，因为 `rope_scaling` 已经不是 `None` 了",
+      "会报错：`max_position_embeddings` 不能小于 `original_max_position_embeddings`"
+    ],
+    "answer": [1],
+    "explain": "实验表格第三行：`end / orig_max = 1024 / 2048 = 0.5`，L69 的 `if end / orig_max > 1.0` 不成立，从 `inv_dim` 到 `freqs = freqs * (1 - ramp + ramp/factor)` 整段被跳过，`torch.equal` 给出 `True`，`cos[1000, 24]` 也回到不开时的 `0.5403`。`rope_scaling` 这个 dict 被白白构造了一遍——**开关打开 ≠ YaRN 生效**，真正的条件是 `config.max_position_embeddings` 大于 `original_max_position_embeddings`。",
+    "ref": "model/model_minimind.py#L69"
+  },
+  {
+    "id": "q14",
+    "type": "single",
+    "question": "`if end / orig_max > 1.0`（L69）里的 `end`，在 MiniMind 的真实调用链里到底是什么？",
+    "options": [
+      "这一次 forward 里 `input_ids.shape[1]` 的实际长度",
+      "`past_key_values` 里已经缓存的位置数，也就是 `start_pos`",
+      "`MiniMindModel.__init__` L205 传进去的 `config.max_position_embeddings`，和推理时输入多长完全无关",
+      "tokenizer 的 `model_max_length`"
+    ],
+    "answer": [2],
+    "explain": "`precompute_freqs_cis` 在整个模型生命周期里只在 `__init__`（L205）被调用一次，`end` 固定是 `config.max_position_embeddings`。默认 `32768 / 2048 = 16 > 1`，所以只要开了 `inference_rope_scaling=True`，**整张表从位置 0 开始就已经被缩放过**，喂 10 个 token 用的也是缩放后的频率——不存在「检测到长输入才动态切换」这种行为。这也是下一节里 `T=512` 的短输入上开启 YaRN 的 loss 也会略微变化的原因。",
+    "ref": "model/model_minimind.py#L69"
+  },
+  {
+    "id": "p3",
+    "type": "single",
+    "question": "拿仓库里的 `out/full_sft_768.pth`（SFT 训练时 `--max_seq_len` 默认只有 768），在 `T=3072` 的长文本上跑，开启默认 YaRN 之后的整段平均 loss，相比不开会怎样？",
+    "options": [
+      "明显更低（4.11 → 约 3.5），和 README 的配图一致",
+      "几乎不变，差值在 0.01 以内",
+      "明显更高（4.11 → 4.38）",
+      "变成 `nan`：低频被压到 1/16 之后数值溢出"
+    ],
+    "answer": [2],
+    "explain": "实验表格后两行：`T=3072` 时关闭 YaRN 是 `4.1141`，开启是 `4.3824`，**开了反而更差**。原因不是 YaRN 方法错，而是超参数错配：`low`/`high` 是按 `original_max_position_embeddings = 2048` 算出来的，而这份 checkpoint 真实只训到 768，压缩量对不上。顺带看 `T=512` 那两行（4.8806 vs 4.8886）：短输入也有微小差别，因为整张表从位置 0 就被改过了。",
+    "ref": "model/model_minimind.py#L64-L73"
+  },
+  {
+    "id": "q15",
+    "type": "single",
+    "question": "上面那个「开了 YaRN 反而更差」的结果，下面哪个结论最站得住脚？",
+    "options": [
+      "YaRN 这个方法本身有问题，按下标分段压缩低频在数学上站不住脚",
+      "默认超参数假设模型在 2048 以内已经学得很稳，而这份权重只训到 768；而且把 `original_max_position_embeddings` 改成 768 也救不回来（实测 4.74，更差）——`inference_rope_scaling` 是个需要实测的旋钮，不是「开了一定更好」的开关",
+      "CPU 上 fp32 精度不够，换到 GPU 上结论会反过来",
+      "因为测试文本是拼接出来的，换任何一段文本结论都会反过来"
+    ],
+    "answer": [1],
+    "explain": "YaRN 是**免训练**的外推手段，它的前提是「模型在 `original_max_position_embeddings` 以内的相对距离上已经学得很稳」，然后把低频压慢、把这份能力摊到更长的范围上。这份 SFT 权重只训到 768，连前提都不满足，压缩低频只是把没学过的一批角度换成另一批没学过的角度。诱人的「那就把 `orig_max` 调成 768」也不成立：`low` 从 8 降到 4、`high` 从 21 降到 17，被压缩的分量更多，实测 loss 反而升到 `4.7397`（实验 task 2 可以验证）。所以正确的态度是把它当成需要在自己的 checkpoint 上实测的旋钮，而不是一个默认更优的开关。",
+    "ref": "model/model_minimind.py#L31-L39"
+  },
+  {
+    "id": "q16",
+    "type": "single",
+    "question": "`MiniMindConfig(hidden_size=768, num_attention_heads=16)`，其余全部默认，`B=3, T=7`，不使用 KV cache。`freqs_cos` 整张表、`position_embeddings` 里的 `cos`、`apply_rotary_pos_emb` 收到的 `q`，三者的 shape 依次是？",
+    "options": [
+      "`[32768, 48]` / `[7, 48]` / `[3, 7, 16, 48]`",
+      "`[32768, 96]` / `[7, 96]` / `[3, 7, 16, 96]`",
+      "`[32768, 48]` / `[3, 7, 48]` / `[3, 7, 16, 48]`",
+      "`[32768, 24]` / `[7, 24]` / `[3, 7, 16, 24]`"
+    ],
+    "answer": [0],
+    "explain": "`head_dim` 默认是 `hidden_size // num_attention_heads = 768 // 16 = 48`（Day 2 的派生值），而 `precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings)` 里 `dim` 就是它，所以表是 `[32768, 48]`。不用 cache 时 `start_pos=0`，切片是 `[0:7]` → `[7, 48]`——注意 `cos` **没有 batch 维**（选项 C 的错误）。`q` 在 L114 被 view 成 `[B, T, H, D] = [3, 7, 16, 48]`，此时还没 `transpose(1,2)`。选项 D 把 `D/2` 当成了表的最后一维，忘了 `cat([cos, cos])`。",
+    "ref": "model/model_minimind.py#L205"
+  },
+  {
+    "id": "q17",
+    "type": "single",
+    "question": "`Attention.forward` 里 `apply_rotary_pos_emb`（L119）发生在 `torch.cat([past_key_value[0], xk], dim=1)`（L121）**之前**。这个顺序意味着什么？",
+    "options": [
+      "KV cache 里存的是**已经旋转过**的 k，历史位置永远不必重算 RoPE；代价是这份 cache 和它当初的绝对起始位置绑死了",
+      "KV cache 里存的是旋转前的 k，每次 forward 都要把整段历史重新旋转一遍",
+      "顺序无所谓：RoPE 是线性变换，先 cat 后转和先转后 cat 结果一样",
+      "这是个 bug，正确写法应该先 cat 再统一做 RoPE"
+    ],
+    "answer": [0],
+    "explain": "先转后 cat，所以 `past_kv = (xk, xv)` 里的 `xk` 是带位置的。这正是 `position_embeddings` 只需要覆盖「本次新增的 token」的前提——解码时切出来的 `cos` 才能退化成 `[1, D]`。选项 C 的陷阱在于：RoPE 确实对每个位置是线性的，但**每个位置用的角度不同**，先 cat 再转会用这一次的 `cos`（只有新位置那一段）去旋转整段历史，长度也对不上。代价则是这份 cache 只在「历史确实从位置 0 开始」时有效，不能平移复用。",
+    "ref": "model/model_minimind.py#L119-L123"
+  },
+  {
+    "id": "q18",
+    "type": "single",
+    "question": "下面四件事里，哪一件**不是**由「`rotate_half` 把 `(x[i], x[i+D/2])` 配成一对」这个约定决定的？",
+    "options": [
+      "`freqs_cos` 用 `cat([cos, cos])` 而不是 `repeat_interleave`",
+      "`cos` 向量的第 `i` 位必须等于第 `i + D/2` 位",
+      "`apply_rotary_pos_emb` 的 `unsqueeze_dim` 默认值是 1",
+      "从 Meta 原版权重转成 HF 格式时要按输出通道做一次 permutation"
+    ],
+    "answer": [2],
+    "explain": "A、B、D 都是配对约定的直接后果：配对是 `(i, i+D/2)` → `cos[i]` 必须等于 `cos[i+D/2]` → 只能用 `cat` 复制 → 换成另一套配对（相邻下标）的权重必须先重排通道。而 `unsqueeze_dim=1` 管的是完全另一件事：**张量布局**。MiniMind 在 `transpose(1,2)` 之前调用 RoPE，`q` 是 `[B,T,H,D]`、`cos` 是 `[T,D]`，所以要在第 1 维插一维；HF Llama 的 `q` 是 `[B,H,T,D]`、`cos` 是 `[B,T,D]`，同样写 1 但广播掉的维度不同。把布局和配对混为一谈是读 RoPE 代码最常见的误解。",
+    "ref": "model/model_minimind.py#L80-L84"
+  },
+  {
+    "id": "q19",
+    "type": "single",
+    "question": "开启 YaRN 之后，「`⟨R_m q, R_n k⟩` 只依赖 `m − n`」这条性质还成立吗？",
+    "options": [
+      "不成立了：频率被按下标分段缩放，破坏了旋转的正交性",
+      "只在 `i < low` 的那几个没被缩放的高频分量上还成立",
+      "只在输入长度超过 `original_max_position_embeddings` 之后才成立",
+      "仍然成立：YaRN 只是把每个分量的角速度换了个常数，`cos`/`sin` 依然只是「绝对位置 × 该分量频率」，每对通道做的还是 2D 旋转"
+    ],
+    "answer": [3],
+    "explain": "YaRN 改的是 `freqs` 这个向量本身（`freqs = freqs * (1 - ramp + ramp/factor)`），改完之后 L75 照样是 `outer(t, freqs)`——角度仍然是位置的线性函数，每对通道仍然是标准 2D 旋转，正交性一点没动。可以直接验证：给 `precompute_freqs_cis` 传 `rope_scaling=dict(..., original_max_position_embeddings=16)` 触发 YaRN，再跑一遍相对位置那个实验，`dots[5,20]` 和 `dots[25,40]` 仍然逐位相同（实测差为 0）。YaRN 要解决的不是这条性质，而是「模型没在这么大的相对距离上训练过」。",
+    "ref": "model/model_minimind.py#L73-L75"
+  }
+]

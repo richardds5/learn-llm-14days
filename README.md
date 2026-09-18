@@ -1,5 +1,7 @@
 # learn-llm-14days
 
+中文 | [English](README_en.md)
+
 **14 天，把一个 LLM 的全部实现读透。**
 
 一个跑在你自己电脑上的交互式学习站：以 [MiniMind](https://github.com/jingyaogong/minimind)（一亿参数、能在笔记本上从零训练的中文小模型）为教材，

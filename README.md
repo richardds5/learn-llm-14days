@@ -154,8 +154,6 @@ learn-llm-14days/
 - 改完跑 `venv/bin/python tools/check_lessons.py --run`：静态检查引用、行号、题目结构，再把所有实验真跑一遍。
 - [tools/briefs/](tools/briefs/) 是本仓库用来让 AI 写课和盲审的任务书，想用同样的流程加一天课可以直接复用。
 
-**内容是怎么做出来的**：课文、题目和实验脚本由作者与 Claude 协作完成——按 `AUTHORING.md` 的规范逐天成稿，另一个独立的 AI 审稿人盲审每一条源码引用和数字结论，`check_lessons.py` 把全部实验跑通，作者逐天试用后多轮返工。即便如此仍可能有错，发现请开 issue。
-
 ## 致谢与协议
 
 - 教材来自 [jingyaogong/minimind](https://github.com/jingyaogong/minimind)（Apache-2.0）。`minimind/` 目录是其 commit [`a3c7b01`](https://github.com/jingyaogong/minimind/commit/a3c7b01cc004d5de86aea961f20bf1e638e7c09e)（2026-09-10）的**原样快照**，源码一个字没改（只去掉了图片和 README），协议见 [minimind/LICENSE](minimind/LICENSE) 与 [NOTICE](NOTICE)。之所以钉死版本，是因为课文按行号引用它。

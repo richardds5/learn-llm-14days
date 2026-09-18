@@ -156,8 +156,6 @@ All content is plain text:
 - After editing run `venv/bin/python tools/check_lessons.py --run`: static checks on references, line numbers and quiz structure, then every lab is executed.
 - [tools/briefs/](tools/briefs/) contains the briefs this repo used to have AI write and blind-review lessons; reuse them to add a day with the same workflow.
 
-**How the content was made**: the lessons, quizzes and lab scripts were written by the author together with Claude — drafted day by day against the `AUTHORING.md` spec, blind-reviewed by a separate AI reviewer that re-checked every source reference and numeric claim, run end to end by `check_lessons.py`, and reworked over several rounds after the author studied each day himself. Mistakes may remain; please open an issue.
-
 ## Credits and license
 
 - The textbook is [jingyaogong/minimind](https://github.com/jingyaogong/minimind) (Apache-2.0). The `minimind/` directory is a **verbatim snapshot** of its commit [`a3c7b01`](https://github.com/jingyaogong/minimind/commit/a3c7b01cc004d5de86aea961f20bf1e638e7c09e) (2026-09-10); not a character of source was changed (only images and the README were dropped). See [minimind/LICENSE](minimind/LICENSE) and [NOTICE](NOTICE). The version is pinned because the lessons cite it by line number.
